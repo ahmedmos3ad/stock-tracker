@@ -1,0 +1,8 @@
+[theme]
+base = "dark"
+# Blue accent for the active tab + primary button (the default red clashed
+# with the red = loss coloring used in the tables).
+primaryColor = "#1f4e7a"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#1c1f26"
+textColor = "#e6e6e6"
