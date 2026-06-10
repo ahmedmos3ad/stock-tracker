@@ -132,7 +132,7 @@ def add_transaction_dialog() -> None:
         c1, c2 = st.columns(2)
         side = c1.selectbox("Side", [BUY, SELL], format_func=str.capitalize)
         txn_date = c2.date_input("Date", value=date.today())
-        quantity = st.number_input("Quantity", min_value=0.0, step=1.0, value=None, placeholder="0")
+        quantity = st.number_input("Quantity", min_value=1, step=1, value=None, placeholder="0")
         c4, c5 = st.columns(2)
         unit_price = c4.number_input(
             f"Price ({CCY})", min_value=0.0, step=0.01, value=None, format="%.4f", placeholder="0.00"
@@ -158,7 +158,7 @@ def add_transaction_dialog() -> None:
                         date=txn_date.isoformat(),
                     )
                 )
-                st.session_state["flash"] = f"Added {side} {quantity:g} {symbol} @ {unit_price:g} {CCY}."
+                st.session_state["flash"] = f"Added {side} {quantity} {symbol} @ {unit_price:g} {CCY}."
                 st.rerun()
 
 
@@ -214,7 +214,7 @@ with tab_portfolio:
             "Your break-even": price(p.breakeven),
             "Break-even %": pct(p.breakeven_pct),
             "Current price": price(p.current_price),
-            "Qty held": round(p.quantity, 4),
+            "Qty held": p.quantity,
             "Total P&L": money(p.total_pnl),
             "Total return %": pct(p.total_return_pct),
             "Unrealized P&L": money(p.unrealized_pnl),

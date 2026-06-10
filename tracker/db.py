@@ -12,6 +12,13 @@ from .portfolio import Transaction
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "portfolio.db"
 
 
+def _as_int_quantity(value: float | int) -> int:
+    qty = float(value)
+    if not qty.is_integer():
+        raise ValueError(f"Invalid non-integer quantity in database: {value!r}")
+    return int(qty)
+
+
 class Store:
     """Thin wrapper over a SQLite connection holding the transaction ledger."""
 
@@ -33,7 +40,7 @@ class Store:
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol   TEXT    NOT NULL,
                 side     TEXT    NOT NULL CHECK (side IN ('buy', 'sell')),
-                quantity REAL    NOT NULL CHECK (quantity > 0),
+                quantity INTEGER NOT NULL CHECK (quantity > 0),
                 price    REAL    NOT NULL CHECK (price >= 0),
                 fee      REAL    NOT NULL DEFAULT 0 CHECK (fee >= 0),
                 date     TEXT    NOT NULL
@@ -53,7 +60,7 @@ class Store:
             cur = self._conn.execute(
                 "INSERT INTO transactions (symbol, side, quantity, price, fee, date) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (txn.symbol.upper().strip(), txn.side, txn.quantity, txn.price, txn.fee, txn.date),
+                (txn.symbol.upper().strip(), txn.side, int(txn.quantity), txn.price, txn.fee, txn.date),
             )
             self._conn.commit()
             return int(cur.lastrowid)
@@ -75,7 +82,7 @@ class Store:
             Transaction(
                 symbol=r["symbol"],
                 side=r["side"],
-                quantity=r["quantity"],
+                quantity=_as_int_quantity(r["quantity"]),
                 price=r["price"],
                 fee=r["fee"],
                 date=r["date"],

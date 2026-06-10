@@ -29,7 +29,7 @@ class Transaction:
 
     symbol: str
     side: str  # BUY or SELL
-    quantity: float
+    quantity: int
     price: float
     fee: float = 0.0
     date: str = ""  # ISO date string, used only for ordering/display
@@ -37,6 +37,8 @@ class Transaction:
     def __post_init__(self) -> None:
         if self.side not in (BUY, SELL):
             raise ValueError(f"side must be '{BUY}' or '{SELL}', got {self.side!r}")
+        if not isinstance(self.quantity, int):
+            raise ValueError("quantity must be an integer")
         if self.quantity <= 0:
             raise ValueError("quantity must be positive")
         if self.price < 0:
@@ -50,7 +52,7 @@ class Position:
     """Computed metrics for one symbol."""
 
     symbol: str
-    quantity: float = 0.0
+    quantity: int = 0
     broker_avg: float = 0.0          # moving weighted-average cost (THNDR-style)
     pure_avg_buy: float = 0.0        # average buy price, ignoring sells/fees
     total_buy_cost: float = 0.0      # sum(qty*price + fee) over buys
@@ -119,7 +121,7 @@ class Position:
 def _replay(symbol: str, txns: list[Transaction]) -> Position:
     """Replay one symbol's transactions in chronological order."""
     pos = Position(symbol=symbol)
-    buy_qty_total = 0.0
+    buy_qty_total = 0
     buy_value_total = 0.0  # sum(qty*price), no fees, for pure average
 
     for t in txns:
