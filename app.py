@@ -6,16 +6,24 @@ Run with:  streamlit run app.py
 from __future__ import annotations
 
 import base64
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
 from tracker import BUY, SELL, Store, Transaction, compute_positions, companies
-from tracker.prices import YFINANCE_AVAILABLE, fetch_latest_price
 
 CCY = "EGP"
 OTHER = "__OTHER__"
+
+
+def cairo_today() -> date:
+    return datetime.now(ZoneInfo("Africa/Cairo")).date()
+
+
+def cairo_now() -> datetime:
+    return datetime.now(ZoneInfo("Africa/Cairo"))
 
 st.set_page_config(page_title="Stock Tracker", page_icon=":chart_with_upwards_trend:", layout="wide")
 
@@ -96,6 +104,22 @@ def pct(value: float | None) -> str:
     if value is None:
         return "—"
     return f"{value * 100:+.2f}%"
+
+
+def freshness_label(updated_at: str | None) -> str:
+    if not updated_at:
+        return "Last refreshed: —"
+    try:
+        refreshed_on = datetime.fromisoformat(updated_at)
+    except ValueError:
+        return f"Last refreshed: {updated_at}"
+    if refreshed_on.tzinfo is None:
+        refreshed_on = refreshed_on.replace(tzinfo=ZoneInfo("Africa/Cairo"))
+    else:
+        refreshed_on = refreshed_on.astimezone(ZoneInfo("Africa/Cairo"))
+    if refreshed_on.date() == cairo_today():
+        return f"Last refreshed today ({refreshed_on.strftime('%Y-%m-%d %H:%M:%S %Z')})"
+    return f"Last refreshed: {refreshed_on.strftime('%Y-%m-%d %H:%M:%S %Z')}"
 
 
 def signed_css(val: str) -> str:
@@ -327,6 +351,7 @@ if st.session_state["show_add_txn"]:
 
 txns = store.transactions()
 saved_prices = store.prices()
+saved_price_entries = store.price_entries()
 
 if not txns:
     st.info("No transactions yet. Click **+ Add transaction** to get started.")
@@ -413,29 +438,6 @@ with tab_portfolio:
 # --- Prices tab --------------------------------------------------------------
 with tab_prices:
     st.caption("Enter the latest market price for each stock you hold. Used for unrealized P&L.")
-    if not YFINANCE_AVAILABLE:
-        st.warning(
-            "Automatic refresh is unavailable in the interpreter that launched Streamlit. "
-            "Manual entry still works, and you can enable refresh by installing `yfinance` in that environment."
-        )
-    refresh_clicked = st.button("Refresh prices from market", type="primary", disabled=not YFINANCE_AVAILABLE)
-    if refresh_clicked:
-        updated = []
-        for sym in symbols:
-            latest_price = fetch_latest_price(sym)
-            if latest_price is None:
-                continue
-            store.set_price(sym, latest_price, date.today().isoformat())
-            updated.append((sym, latest_price))
-
-        if updated:
-            st.session_state["prices_refresh_notice"] = f"Updated {len(updated)} price{'s' if len(updated) != 1 else ''} from market data."
-        else:
-            st.session_state["prices_refresh_notice"] = "No market prices were found for the selected symbols."
-        st.rerun()
-
-    if st.session_state.get("prices_refresh_notice"):
-        st.success(st.session_state.pop("prices_refresh_notice"))
 
     pcols = st.columns(min(4, len(symbols)) or 1)
     for i, sym in enumerate(symbols):
@@ -456,8 +458,9 @@ with tab_prices:
                 key=f"price_{sym}",
                 label_visibility="collapsed",
             )
+            col.caption(freshness_label(saved_price_entries.get(sym, {}).get("updated_at")))
             if new_price and new_price != saved_prices.get(sym):
-                store.set_price(sym, new_price, date.today().isoformat())
+                store.set_price(sym, new_price, cairo_now().isoformat(timespec="seconds"))
                 st.rerun()
 
 # --- Transactions tab --------------------------------------------------------

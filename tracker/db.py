@@ -122,6 +122,17 @@ class Store:
             rows = self._conn.execute("SELECT symbol, current_price FROM prices").fetchall()
         return {r["symbol"]: r["current_price"] for r in rows}
 
+    def price_entries(self) -> dict[str, dict[str, str | float]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT symbol, current_price, updated_at FROM prices").fetchall()
+        return {
+            r["symbol"]: {
+                "current_price": r["current_price"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        }
+
     def get_price(self, symbol: str) -> Optional[float]:
         return self.prices().get(symbol.upper().strip())
 
