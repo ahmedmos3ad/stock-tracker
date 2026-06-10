@@ -65,6 +65,23 @@ class Store:
             self._conn.commit()
             return int(cur.lastrowid)
 
+    def update_transaction(self, txn_id: int, txn: Transaction) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE transactions SET symbol = ?, side = ?, quantity = ?, price = ?, fee = ?, date = ? "
+                "WHERE id = ?",
+                (
+                    txn.symbol.upper().strip(),
+                    txn.side,
+                    int(txn.quantity),
+                    txn.price,
+                    txn.fee,
+                    txn.date,
+                    txn_id,
+                ),
+            )
+            self._conn.commit()
+
     def delete_transaction(self, txn_id: int) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM transactions WHERE id = ?", (txn_id,))

@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from tracker import BUY, SELL, Store, Transaction, compute_positions, companies
+from tracker.prices import YFINANCE_AVAILABLE, fetch_latest_price
 
 CCY = "EGP"
 OTHER = "__OTHER__"
@@ -25,6 +26,17 @@ def get_store() -> Store:
 
 
 store = get_store()
+
+if "show_add_txn" not in st.session_state:
+    st.session_state["show_add_txn"] = False
+if "add_txn_stage" not in st.session_state:
+    st.session_state["add_txn_stage"] = "form"
+if "add_txn_message" not in st.session_state:
+    st.session_state["add_txn_message"] = None
+if "txn_dialog_mode" not in st.session_state:
+    st.session_state["txn_dialog_mode"] = "add"
+if "txn_dialog_id" not in st.session_state:
+    st.session_state["txn_dialog_id"] = None
 
 
 @st.cache_data(show_spinner=False)
@@ -109,8 +121,111 @@ def badge(text: str, color: str) -> str:
     )
 
 
-@st.dialog("➕ Add a transaction", width="large")
+def reset_txn_form_state() -> None:
+    st.session_state["sel_symbol"] = OTHER
+    st.session_state["custom_symbol"] = ""
+    st.session_state["txn_side"] = BUY
+    st.session_state["txn_date"] = date.today()
+    st.session_state["txn_quantity"] = None
+    st.session_state["txn_price"] = None
+    st.session_state["txn_fee"] = None
+
+
+def load_txn_form_state(txn: dict) -> None:
+    st.session_state["sel_symbol"] = txn["symbol"] if txn["symbol"] in companies.COMPANIES else OTHER
+    st.session_state["custom_symbol"] = "" if txn["symbol"] in companies.COMPANIES else txn["symbol"]
+    st.session_state["txn_side"] = txn["side"]
+    st.session_state["txn_date"] = date.fromisoformat(txn["date"])
+    st.session_state["txn_quantity"] = int(txn["quantity"])
+    st.session_state["txn_price"] = float(txn["price"])
+    st.session_state["txn_fee"] = float(txn["fee"])
+
+
+def open_add_transaction_dialog() -> None:
+    st.session_state["show_add_txn"] = True
+    st.session_state["txn_dialog_mode"] = "add"
+    st.session_state["txn_dialog_id"] = None
+    st.session_state["add_txn_stage"] = "form"
+    st.session_state["add_txn_message"] = None
+    reset_txn_form_state()
+
+
+def open_edit_transaction_dialog(txn: dict) -> None:
+    st.session_state["show_add_txn"] = True
+    st.session_state["txn_dialog_mode"] = "edit"
+    st.session_state["txn_dialog_id"] = txn["id"]
+    st.session_state["add_txn_stage"] = "form"
+    st.session_state["add_txn_message"] = None
+    load_txn_form_state(txn)
+
+
+def close_transaction_dialog() -> None:
+    st.session_state["show_add_txn"] = False
+    st.session_state["txn_dialog_mode"] = "add"
+    st.session_state["txn_dialog_id"] = None
+    st.session_state["add_txn_stage"] = "form"
+    st.session_state["add_txn_message"] = None
+    st.session_state.pop("sel_symbol", None)
+    st.session_state.pop("custom_symbol", None)
+    st.session_state.pop("txn_side", None)
+    st.session_state.pop("txn_date", None)
+    st.session_state.pop("txn_quantity", None)
+    st.session_state.pop("txn_price", None)
+    st.session_state.pop("txn_fee", None)
+
+
+def success_panel(message: str) -> None:
+    st.markdown(
+        """
+        <style>
+        @keyframes addTxnPop {
+            0% { opacity: 0; transform: translateY(-6px) scale(0.98); }
+            100% { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        .add-txn-success {
+            background: rgba(46, 204, 113, 0.14);
+            border: 1px solid rgba(46, 204, 113, 0.35);
+            color: #1f7a4f;
+            padding: 0.8rem 0.9rem;
+            border-radius: 0.8rem;
+            font-weight: 600;
+            animation: addTxnPop 180ms ease-out;
+            margin-bottom: 0.75rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='add-txn-success'>✅ {message}<br><span style='font-weight:500'>Create another or close the dialog.</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
+@st.dialog("🧾 Transaction", width="large")
 def add_transaction_dialog() -> None:
+    mode = st.session_state["txn_dialog_mode"]
+    if st.session_state["add_txn_stage"] == "success":
+        if mode == "edit":
+            success_panel(st.session_state["add_txn_message"] or "Transaction updated.")
+            if st.button("Close", use_container_width=True):
+                close_transaction_dialog()
+                st.rerun()
+        else:
+            success_panel(st.session_state["add_txn_message"] or "Transaction added.")
+            c1, c2 = st.columns(2)
+            if c1.button("Create another", type="primary", use_container_width=True):
+                st.session_state["add_txn_stage"] = "form"
+                st.session_state["add_txn_message"] = None
+                st.session_state["txn_dialog_mode"] = "add"
+                st.session_state["txn_dialog_id"] = None
+                reset_txn_form_state()
+                st.rerun()
+            if c2.button("Close", use_container_width=True):
+                close_transaction_dialog()
+                st.rerun()
+        return
+
     # Company selector is outside the form so the logo preview updates live.
     options = sorted(companies.COMPANIES.keys()) + [OTHER]
     logo_col, pick_col = st.columns([1, 6], vertical_alignment="center")
@@ -130,36 +245,68 @@ def add_transaction_dialog() -> None:
 
     with st.form("add_txn", clear_on_submit=True, border=False):
         c1, c2 = st.columns(2)
-        side = c1.selectbox("Side", [BUY, SELL], format_func=str.capitalize)
-        txn_date = c2.date_input("Date", value=date.today())
-        quantity = st.number_input("Quantity", min_value=1, step=1, value=None, placeholder="0")
+        side = c1.selectbox("Side", [BUY, SELL], format_func=str.capitalize, key="txn_side")
+        txn_date = c2.date_input("Date", key="txn_date")
+        quantity = st.number_input(
+            "Quantity",
+            min_value=1,
+            step=1,
+            placeholder="0",
+            key="txn_quantity",
+        )
         c4, c5 = st.columns(2)
         unit_price = c4.number_input(
-            f"Price ({CCY})", min_value=0.0, step=0.01, value=None, format="%.4f", placeholder="0.00"
+            f"Price ({CCY})",
+            min_value=0.0,
+            step=0.01,
+            format="%.4f",
+            placeholder="0.00",
+            key="txn_price",
         )
         fee = c5.number_input(
-            f"Fee ({CCY})", min_value=0.0, step=0.01, value=None, format="%.2f", placeholder="0.00"
+            f"Fee ({CCY})",
+            min_value=0.0,
+            step=0.01,
+            format="%.2f",
+            placeholder="0.00",
+            key="txn_fee",
         )
         st.write("")
-        submitted = st.form_submit_button("Add transaction", type="primary", use_container_width=True)
+        submit_label = "Save changes" if mode == "edit" else "Add transaction"
+        submitted = st.form_submit_button(submit_label, type="primary", use_container_width=True)
         if submitted:
             if not symbol:
                 st.error("Pick a company or type a symbol.")
             elif not quantity or not unit_price:
                 st.error("Quantity and price must be greater than zero.")
             else:
-                store.add_transaction(
-                    Transaction(
-                        symbol=symbol,
-                        side=side,
-                        quantity=quantity,
-                        price=unit_price,
-                        fee=fee or 0.0,
-                        date=txn_date.isoformat(),
-                    )
+                txn = Transaction(
+                    symbol=symbol,
+                    side=side,
+                    quantity=int(quantity),
+                    price=unit_price,
+                    fee=fee or 0.0,
+                    date=txn_date.isoformat(),
                 )
-                st.session_state["flash"] = f"Added {side} {quantity} {symbol} @ {unit_price:g} {CCY}."
-                st.rerun()
+                if mode == "edit":
+                    txn_id = st.session_state.get("txn_dialog_id")
+                    if txn_id is None:
+                        st.error("No transaction selected for editing.")
+                    else:
+                        store.update_transaction(int(txn_id), txn)
+                        st.session_state["add_txn_message"] = f"Updated {side} {int(quantity)} {symbol} @ {unit_price:g} {CCY}."
+                        st.session_state["add_txn_stage"] = "success"
+                        st.rerun()
+                else:
+                    store.add_transaction(txn)
+                    st.session_state["add_txn_message"] = f"Added {side} {int(quantity)} {symbol} @ {unit_price:g} {CCY}."
+                    st.session_state["add_txn_stage"] = "success"
+                    st.rerun()
+
+    if st.session_state["add_txn_stage"] == "form":
+        if st.button("Close", use_container_width=True):
+            close_transaction_dialog()
+            st.rerun()
 
 
 # --- Header ------------------------------------------------------------------
@@ -168,15 +315,15 @@ with title_col:
     st.title("📈 Stock Tracker")
 with action_col:
     if st.button("\\+ Add transaction", type="primary", use_container_width=True):
-        add_transaction_dialog()
+        open_add_transaction_dialog()
 
 st.caption(
     "Tracks your *true* average across buy/sell round-trips — not the "
     "broker's moving average that drifts when you sell high and re-buy low."
 )
 
-if "flash" in st.session_state:
-    st.toast(st.session_state.pop("flash"), icon="✅")
+if st.session_state["show_add_txn"]:
+    add_transaction_dialog()
 
 txns = store.transactions()
 saved_prices = store.prices()
@@ -266,6 +413,30 @@ with tab_portfolio:
 # --- Prices tab --------------------------------------------------------------
 with tab_prices:
     st.caption("Enter the latest market price for each stock you hold. Used for unrealized P&L.")
+    if not YFINANCE_AVAILABLE:
+        st.warning(
+            "Automatic refresh is unavailable in the interpreter that launched Streamlit. "
+            "Manual entry still works, and you can enable refresh by installing `yfinance` in that environment."
+        )
+    refresh_clicked = st.button("Refresh prices from market", type="primary", disabled=not YFINANCE_AVAILABLE)
+    if refresh_clicked:
+        updated = []
+        for sym in symbols:
+            latest_price = fetch_latest_price(sym)
+            if latest_price is None:
+                continue
+            store.set_price(sym, latest_price, date.today().isoformat())
+            updated.append((sym, latest_price))
+
+        if updated:
+            st.session_state["prices_refresh_notice"] = f"Updated {len(updated)} price{'s' if len(updated) != 1 else ''} from market data."
+        else:
+            st.session_state["prices_refresh_notice"] = "No market prices were found for the selected symbols."
+        st.rerun()
+
+    if st.session_state.get("prices_refresh_notice"):
+        st.success(st.session_state.pop("prices_refresh_notice"))
+
     pcols = st.columns(min(4, len(symbols)) or 1)
     for i, sym in enumerate(symbols):
         col = pcols[i % len(pcols)]
@@ -291,10 +462,18 @@ with tab_prices:
 
 # --- Transactions tab --------------------------------------------------------
 with tab_txns:
-    ledger = store.list_transactions()
+    all_ledger = list(reversed(store.list_transactions()))
     pending_delete = st.session_state.get("pending_delete")
 
-    COL_WIDTHS = [2, 2, 1.2, 1.3, 1.6, 1.4, 1.8, 1.4]
+    symbol_options = ["All stocks"] + sorted({r["symbol"] for r in all_ledger})
+    selected_symbol = st.selectbox(
+        "Filter by stock symbol",
+        symbol_options,
+        key="txn_symbol_filter",
+    )
+    ledger = [r for r in all_ledger if selected_symbol == "All stocks" or r["symbol"] == selected_symbol]
+
+    COL_WIDTHS = [2, 2, 1.2, 1.3, 1.6, 1.4, 1.8, 0.8]
     HEADERS = ["Date", "Symbol", "Side", "Qty", "Price", "Fee", "Total", ""]
 
     header_cols = st.columns(COL_WIDTHS)
@@ -326,7 +505,11 @@ with tab_txns:
                 st.session_state.pop("pending_delete", None)
                 st.rerun()
         else:
-            if cols[7].button("🗑", key=f"del_{r['id']}", help="Delete this transaction"):
+            edit_col, del_col = cols[7].columns([1, 1], gap="small")
+            if edit_col.button("✏️", key=f"edit_{r['id']}", help="Edit this transaction"):
+                open_edit_transaction_dialog(r)
+                st.rerun()
+            if del_col.button("🗑", key=f"del_{r['id']}", help="Delete this transaction"):
                 st.session_state["pending_delete"] = r["id"]
                 st.rerun()
 
