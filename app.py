@@ -501,10 +501,12 @@ with tab_txns:
         if pending_delete == r["id"]:
             confirm, cancel = cols[7].columns(2)
             if confirm.button("✅", key=f"confirm_{r['id']}", help="Confirm delete"):
+                close_transaction_dialog()
                 store.delete_transaction(r["id"])
                 st.session_state.pop("pending_delete", None)
                 st.rerun()
             if cancel.button("✖️", key=f"cancel_{r['id']}", help="Cancel"):
+                close_transaction_dialog()
                 st.session_state.pop("pending_delete", None)
                 st.rerun()
         else:
@@ -513,6 +515,7 @@ with tab_txns:
                 open_edit_transaction_dialog(r)
                 st.rerun()
             if del_col.button("🗑", key=f"del_{r['id']}", help="Delete this transaction"):
+                close_transaction_dialog()
                 st.session_state["pending_delete"] = r["id"]
                 st.rerun()
 
