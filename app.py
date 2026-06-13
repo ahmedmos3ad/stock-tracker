@@ -6,6 +6,12 @@ Run with:  streamlit run app.py
 from __future__ import annotations
 
 import base64
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Locates the .env file exactly where app.py lives, regardless of terminal path
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -13,6 +19,7 @@ import pandas as pd
 import streamlit as st
 
 from tracker import BUY, SELL, Store, Transaction, compute_positions, companies
+from tracker.prices import fetch_latest_eodhd_close
 
 CCY = "EGP"
 OTHER = "__OTHER__"
@@ -45,6 +52,8 @@ if "txn_dialog_mode" not in st.session_state:
     st.session_state["txn_dialog_mode"] = "add"
 if "txn_dialog_id" not in st.session_state:
     st.session_state["txn_dialog_id"] = None
+if "price_sync_message" not in st.session_state:
+    st.session_state["price_sync_message"] = None
 
 
 @st.cache_data(show_spinner=False)
@@ -437,7 +446,74 @@ with tab_portfolio:
 
 # --- Prices tab --------------------------------------------------------------
 with tab_prices:
-    st.caption("Enter the latest market price for each stock you hold. Used for unrealized P&L.")
+    st.caption("Enter the latest market price for each stock you hold, or sync EOD closes from EODHD.")
+    
+    sync_col, api_col = st.columns([1, 1], vertical_alignment="bottom")
+    
+
+    with api_col:
+        eodhd_api_key = st.text_input(
+            "🔑 EODHD API Key",
+            value=os.getenv("EODHD_API_KEY", ""),
+            type="password",
+            placeholder="Paste token or set env variable...",
+            help="Free plan: 20 calls/day.",
+            key="tab_eodhd_api_key" # explicit key prevents interaction collisions
+        )
+
+    if st.session_state.get("price_sync_message"):
+        st.info(st.session_state["price_sync_message"])
+    
+    sync_disabled = not eodhd_api_key.strip()
+
+    with sync_col:
+        # Pushed button inside the grid column
+        if sync_disabled:
+            st.caption("⚠️ *Provide an API key to enable sync*")
+        sync_clicked = st.button(
+            "Sync closes from EODHD",
+            type="primary",
+            use_container_width=True,
+            disabled=sync_disabled,
+        )
+
+
+
+    if sync_clicked:
+        if not eodhd_api_key.strip():
+            st.session_state["price_sync_message"] = "Add your EODHD API key in the sidebar first."
+            st.rerun()
+
+        updated_symbols: list[str] = []
+        unchanged_symbols: list[str] = []
+        skipped_symbols: list[str] = []
+        timestamp = cairo_now().isoformat(timespec="seconds")
+
+        for sym in symbols:
+            snapshot = fetch_latest_eodhd_close(sym, eodhd_api_key)
+            if snapshot is None:
+                skipped_symbols.append(sym)
+                continue
+
+            existing_price = saved_prices.get(sym)
+            if existing_price is None or abs(existing_price - snapshot.price) > 1e-9:
+                store.set_price(sym, snapshot.price, timestamp)
+                updated_symbols.append(sym)
+            else:
+                unchanged_symbols.append(sym)
+
+        parts: list[str] = []
+        if updated_symbols:
+            parts.append(f"Updated {len(updated_symbols)} symbol(s): {', '.join(updated_symbols)}.")
+        if unchanged_symbols:
+            parts.append(f"{len(unchanged_symbols)} symbol(s) already matched the latest close.")
+        if skipped_symbols:
+            parts.append(f"Skipped {len(skipped_symbols)} symbol(s) with no EODHD match: {', '.join(skipped_symbols)}.")
+        if not parts:
+            parts.append("No prices were returned by EODHD.")
+
+        st.session_state["price_sync_message"] = " ".join(parts)
+        st.rerun()
 
     pcols = st.columns(min(4, len(symbols)) or 1)
     for i, sym in enumerate(symbols):

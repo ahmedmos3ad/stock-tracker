@@ -42,6 +42,16 @@ Streamlit opens the dashboard in your browser (usually http://localhost:8501).
 Your data is saved in `portfolio.db` next to the app — back up that single file
 to back up everything.
 
+## EODHD price sync
+
+To use the one-click EOD close sync in the Prices tab, set `EODHD_API_KEY`
+before launching the app, or paste the key into the sidebar after it opens.
+The exchange code defaults to `CA` for EGX symbols, and you can override it
+with `EODHD_EXCHANGE_CODE` if needed.
+
+The free EODHD plan is enough for manual syncs, but it is limited to 20 API
+calls per day and one year of historical EOD data.
+
 ## Setup / Run (macOS / Linux)
 
 ```bash

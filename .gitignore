@@ -17,3 +17,6 @@ portfolio.db
 
 # Streamlit local secrets
 .streamlit/secrets.toml
+
+# dotenv local secrets
+.env
