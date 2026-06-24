@@ -206,6 +206,26 @@ def close_transaction_dialog() -> None:
     st.session_state.pop("txn_price", None)
     st.session_state.pop("txn_fee", None)
 
+def reset_dividend_form_state() -> None:
+    st.session_state["div_symbol"] = OTHER
+    st.session_state["div_custom_symbol"] = ""
+    st.session_state["div_date"] = date.today()
+    st.session_state["div_amount"] = None
+
+def open_add_dividend_dialog() -> None:
+    st.session_state["show_add_dividend"] = True
+    st.session_state["dividend_stage"] = "form"
+    st.session_state["dividend_message"] = None
+    reset_dividend_form_state()
+
+def close_dividend_dialog() -> None:
+    st.session_state["show_add_dividend"] = False
+    st.session_state.pop("div_symbol", None)
+    st.session_state.pop("div_custom_symbol", None)
+    st.session_state.pop("div_date", None)
+    st.session_state.pop("div_amount", None)
+    st.session_state.pop("dividend_stage", None)
+    st.session_state.pop("dividend_message", None)
 
 def success_panel(message: str) -> None:
     st.markdown(
@@ -341,6 +361,81 @@ def add_transaction_dialog() -> None:
             close_transaction_dialog()
             st.rerun()
 
+@st.dialog("💰 Dividend")
+def add_dividend_dialog() -> None:
+    if st.session_state.get("dividend_stage") == "success":
+        success_panel(st.session_state["dividend_message"] or "Dividend added.")
+
+        c1, c2 = st.columns(2)
+
+        if c1.button("Add another", type="primary", use_container_width=True):
+            st.session_state["dividend_stage"] = "form"
+            st.session_state["dividend_message"] = None
+            reset_dividend_form_state()
+            st.rerun()
+
+        if c2.button("Close", use_container_width=True):
+            close_dividend_dialog()
+            st.rerun()
+
+        return
+
+    options = sorted(companies.COMPANIES.keys()) + [OTHER]
+
+    selected = st.selectbox(
+        "Company",
+        options,
+        format_func=lambda s: "Other (type a symbol)…" if s == OTHER else companies.display_label(s),
+        key="div_symbol",
+    )
+
+    if selected == OTHER:
+        symbol = st.text_input(
+            "Symbol",
+            placeholder="e.g. RACC",
+            key="div_custom_symbol",
+        ).strip().upper()
+    else:
+        symbol = selected
+
+    with st.form("add_dividend", border=False):
+        dividend_date = st.date_input("Date", key="div_date")
+
+        amount = st.number_input(
+            f"Amount ({CCY})",
+            min_value=0.0,
+            step=0.01,
+            format="%.2f",
+            key="div_amount",
+        )
+
+        submitted = st.form_submit_button(
+            "Add dividend",
+            type="primary",
+            use_container_width=True,
+        )
+
+        if submitted:
+            if not symbol:
+                st.error("Pick a company or type a symbol.")
+            elif not amount:
+                st.error("Amount must be greater than zero.")
+            else:
+                store.add_dividend(
+                    symbol=symbol,
+                    amount=float(amount),
+                    date=dividend_date.isoformat(),
+                )
+
+                st.session_state["dividend_message"] = (
+                    f"Added dividend of {amount:g} {CCY} for {symbol}."
+                )
+                st.session_state["dividend_stage"] = "success"
+                st.rerun()
+
+    if st.button("Close", use_container_width=True):
+        close_dividend_dialog()
+        st.rerun()
 
 # --- Header ------------------------------------------------------------------
 title_col, action_col = st.columns([5, 1], vertical_alignment="center")
@@ -366,10 +461,10 @@ if not txns:
     st.info("No transactions yet. Click **+ Add transaction** to get started.")
     st.stop()
 
-positions = compute_positions(txns, prices=saved_prices)
+positions = compute_positions(txns, dividends=store.dividends(), prices=saved_prices)
 symbols = sorted({t.symbol for t in txns})
 
-tab_portfolio, tab_prices, tab_txns = st.tabs(["📊 Portfolio", "💲 Prices", "🧾 Transactions"])
+tab_portfolio, tab_prices, tab_txns, tab_dividends = st.tabs(["📊 Portfolio", "💲 Prices", "🧾 Transactions", "💰 Dividends"])
 
 # --- Portfolio tab -----------------------------------------------------------
 with tab_portfolio:
@@ -596,4 +691,58 @@ with tab_txns:
                 st.rerun()
 
     if pending_delete is not None and any(r["id"] == pending_delete for r in ledger):
+        st.warning("Click ✅ to confirm deletion, or ✖️ to cancel.")
+
+# --- Dividends tab ------------------------------------------------------------
+with tab_dividends:
+    all_dividends = list(reversed(store.list_dividends()))
+    pending_delete = st.session_state.get("pending_delete")
+
+    if st.button("➕ Add Dividend"):
+        open_add_dividend_dialog()
+
+    if st.session_state.get("show_add_dividend"):
+        add_dividend_dialog()
+
+    symbol_options = ["All stocks"] + sorted({r["symbol"] for r in all_dividends})
+    selected_symbol = st.selectbox(
+        "Filter by stock symbol",
+        symbol_options,
+        key="dividend_symbol_filter",
+    )
+    dividends = [r for r in all_dividends if selected_symbol == "All stocks" or r["symbol"] == selected_symbol]
+
+    COL_WIDTHS = [2, 2, 1.5, 1.5, 0.8]
+    HEADERS = ["Date", "Symbol", "Amount", "Total (EGP)", ""]
+
+    header_cols = st.columns(COL_WIDTHS)
+    for col, label in zip(header_cols, HEADERS):
+        col.markdown(f"<span style='color:#9aa0a6;font-size:12px;'>{label}</span>", unsafe_allow_html=True)
+    st.divider()
+
+    for r in dividends:
+        cols = st.columns(COL_WIDTHS, vertical_alignment="center")
+        cols[0].write(r["date"])
+        cols[1].write(f"**{r['symbol']}**")
+        cols[2].write(f"{r['amount']:,.2f}")
+        cols[3].write(f"{r['amount']:,.2f} {CCY}")
+        if pending_delete == r["id"]:
+            confirm, cancel = cols[4].columns(2)
+            if confirm.button("✅", key=f"confirm_div_{r['id']}", help="Confirm delete"):
+                close_transaction_dialog()
+                store.delete_dividend(r["id"])
+                st.session_state.pop("pending_delete", None)
+                st.rerun()
+            if cancel.button("✖️", key=f"cancel_div_{r['id']}", help="Cancel"):
+                close_transaction_dialog()
+                st.session_state.pop("pending_delete", None)
+                st.rerun()
+        else:
+            del_col = cols[4]
+            if del_col.button("🗑", key=f"del_div_{r['id']}", help="Delete this dividend"):
+                close_transaction_dialog()
+                st.session_state["pending_delete"] = r["id"]
+                st.rerun()
+
+    if pending_delete is not None and any(r["id"] == pending_delete for r in dividends):
         st.warning("Click ✅ to confirm deletion, or ✖️ to cancel.")

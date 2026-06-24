@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from .portfolio import Transaction
+from .portfolio import Dividend, Transaction
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "portfolio.db"
 
@@ -50,6 +50,13 @@ class Store:
                 symbol        TEXT PRIMARY KEY,
                 current_price REAL NOT NULL,
                 updated_at    TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS dividends (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol   TEXT    NOT NULL,
+                amount   REAL    NOT NULL CHECK (amount >= 0),
+                date     TEXT    NOT NULL
             );
             """
             )
@@ -105,6 +112,51 @@ class Store:
                 date=r["date"],
             )
             for r in self.list_transactions()
+        ]
+    
+    def add_dividend(self, symbol: str, amount: float, date: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO dividends (symbol, amount, date) VALUES (?, ?, ?)",
+                (symbol.upper().strip(), amount, date),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+    
+    
+    def delete_dividend(self, dividend_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM dividends WHERE id = ?", (dividend_id,))
+            self._conn.commit()
+
+    def update_dividend(self, dividend_id: int, symbol: str, amount: float, date: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE dividends SET symbol = ?, amount = ?, date = ? WHERE id = ?",
+                (
+                    symbol.upper().strip(), 
+                    amount, 
+                    date, 
+                    dividend_id
+                ),
+            )
+            self._conn.commit()
+
+    def list_dividends(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dividends ORDER BY date, id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+    
+    def dividends(self) -> list[Dividend]:
+        return [
+            Dividend(
+                symbol=r["symbol"],
+                amount=r["amount"],
+                date=r["date"],
+            )
+            for r in self.list_dividends()
         ]
 
     def set_price(self, symbol: str, price: float, updated_at: str) -> None:

@@ -46,6 +46,15 @@ class Transaction:
         if self.fee < 0:
             raise ValueError("fee cannot be negative")
 
+@dataclass(frozen=True)
+class Dividend:
+    symbol: str
+    amount: float
+    date: str = ""
+
+    def __post_init__(self) -> None:
+        if self.amount < 0:
+            raise ValueError("amount cannot be negative")
 
 @dataclass
 class Position:
@@ -59,11 +68,12 @@ class Position:
     total_sell_proceeds: float = 0.0 # sum(qty*price - fee) over sells
     realized_pnl: float = 0.0        # locked-in profit from sells
     current_price: Optional[float] = None
+    dividends_received: float = 0.0
 
     @property
     def net_invested(self) -> float:
         """Cash still tied up: money in minus money already taken out."""
-        return self.total_buy_cost - self.total_sell_proceeds
+        return self.total_buy_cost - self.total_sell_proceeds - self.dividends_received
 
     @property
     def breakeven(self) -> Optional[float]:
@@ -149,6 +159,7 @@ def _replay(symbol: str, txns: list[Transaction]) -> Position:
 
 def compute_positions(
     transactions: Iterable[Transaction],
+    dividends: Iterable[Dividend] = (),
     prices: Optional[dict[str, float]] = None,
 ) -> list[Position]:
     """Compute one Position per symbol from a flat list of transactions.
@@ -161,10 +172,19 @@ def compute_positions(
     for t in transactions:
         by_symbol.setdefault(t.symbol, []).append(t)
 
+    dividends_by_symbol: dict[str, float] = {}
+    for d in dividends:
+        dividends_by_symbol.setdefault(d.symbol, 0.0)
+        dividends_by_symbol[d.symbol] += d.amount
+
     positions: list[Position] = []
     for symbol, txns in by_symbol.items():
         ordered = sorted(txns, key=lambda x: (x.date, x.side == SELL))
         pos = _replay(symbol, ordered)
+
+        pos.dividends_received = dividends_by_symbol.get(symbol, 0.0)
+        pos.realized_pnl += pos.dividends_received
+
         if symbol in prices:
             pos.current_price = prices[symbol]
         positions.append(pos)
