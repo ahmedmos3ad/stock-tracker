@@ -312,7 +312,7 @@ def transaction_dialog(txn: dict | None, nonce: int, funds) -> None:
         else:
             new_txn = Transaction(
                 symbol=symbol, side=side, quantity=int(quantity), price=unit_price,
-                fee=fee if fee else auto_fee, date=txn_date.isoformat(),
+                fee=fee if fee is not None else auto_fee, date=txn_date.isoformat(),
             )
             if editing:
                 store.update_transaction(int(txn["id"]), new_txn)
