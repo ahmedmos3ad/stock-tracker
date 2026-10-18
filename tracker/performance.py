@@ -114,14 +114,16 @@ def equity_curve(
     transactions: list[Transaction],
     history: dict[str, list[tuple[str, float]]],
     end: Optional[str] = None,
+    dividends: Iterable[Dividend] = (),
 ) -> list[dict]:
     """Daily portfolio value vs. net cash contributed.
 
-    value       = sum(shares held * last known close on/before that day)
+    value       = sum(shares held * last known close on/before that day) + dividends received so far
     contributed = cumulative buys (incl. fees) - cumulative sell proceeds (net of fees)
 
     Prices fall back to the last traded price from the ledger when no history exists yet.
-    Dividends are excluded: the gap between the lines is trading profit only.
+    Dividends are cash received, so they are added to value from their payment date: the gap
+    between the lines is total profit (trading + dividends), matching the Total profit metric.
     """
     if not transactions:
         return []
@@ -133,6 +135,8 @@ def equity_curve(
     last_trade_price: dict[str, float] = {}
     contributed = 0.0
     i, n = 0, len(txns)
+    divs = sorted((d.date, d.amount) for d in dividends if d.amount)
+    j, received = 0, 0.0
     out = []
     day = start
     while day <= stop:
@@ -149,7 +153,10 @@ def equity_curve(
             if t.price > 0:
                 last_trade_price[t.symbol] = t.price
             i += 1
-        value = 0.0
+        while j < len(divs) and divs[j][0] <= iso:
+            received += divs[j][1]
+            j += 1
+        value = received
         for sym, q in qty.items():
             if q <= 0:
                 continue

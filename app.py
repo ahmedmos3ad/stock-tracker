@@ -1514,7 +1514,7 @@ def perf_tab(positions, adj_txns, dividends, history, price_entries) -> None:
         )
 
     # --- equity curve -------------------------------------------------------------
-    curve = perf.equity_curve(adj_txns, curve_history, end=today)
+    curve = perf.equity_curve(adj_txns, curve_history, end=today, dividends=dividends)
     df = pd.DataFrame(curve)
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date")
@@ -1525,7 +1525,7 @@ def perf_tab(positions, adj_txns, dividends, history, price_entries) -> None:
     )
     priced_days = len({d for s in held_symbols for d, _ in history.get(s, [])})
     st.caption(
-        f"Gap between the lines = trading profit (dividends excluded). Built from {priced_days:,} days of saved "
+        f"Portfolio value includes dividends received; gap to net deposits = total profit. Built from {priced_days:,} days of saved "
         "prices; days without a saved price use your last trade price. History uses raw (unadjusted) EODHD "
         "closes, matching the share counts in your ledger."
     )
