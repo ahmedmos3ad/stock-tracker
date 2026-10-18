@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from tracker import BUY, SELL, Store, Transaction, compute_positions, companies
 from tracker import performance as perf
@@ -30,6 +31,7 @@ from tracker.calculator import (
     simulate_dca,
     simulate_sell,
 )
+from tracker.chart import HEIGHT as CARD_HEIGHT, card_html
 from tracker.history import EGX30_SYMBOL, fetch_history
 from tracker.portfolio import Dividend
 from tracker.prices import fetch_latest_eodhd_close
@@ -1488,22 +1490,12 @@ def perf_tab(positions, adj_txns, dividends, history, price_entries) -> None:
         )
 
     # --- equity curve -------------------------------------------------------------
-    st.subheader("Portfolio value vs money invested")
     curve = perf.equity_curve(adj_txns, curve_history, end=today)
     df = pd.DataFrame(curve)
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date")
-    span = st.radio("Range", ["1M", "3M", "6M", "1Y", "All"], index=4, horizontal=True,
-                    key="perf_range", label_visibility="collapsed")
-    window = {"1M": 30, "3M": 91, "6M": 182, "1Y": 365}.get(span)
-    if window:
-        df = df[df.index >= df.index.max() - pd.Timedelta(days=window)]
-    st.line_chart(
-        df.rename(columns={"value": "Portfolio value", "contributed": "Net cash invested"})[
-            ["Portfolio value", "Net cash invested"]
-        ],
-        color=["#2ecc71", "#9aa0a6"],
-    )
+    stamps = [str(e["updated_at"])[:10] for e in price_entries.values() if e.get("updated_at")]
+    components.html(card_html(df, max(stamps) if stamps else today, CCY), height=CARD_HEIGHT)
     priced_days = len({d for s in held_symbols for d, _ in history.get(s, [])})
     st.caption(
         f"Gap between the lines = trading profit (dividends excluded). Built from {priced_days:,} days of saved "
