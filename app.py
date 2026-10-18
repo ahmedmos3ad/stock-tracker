@@ -25,7 +25,7 @@ from tracker.actions import apply_corporate_actions, resolve_actions
 from tracker.assets import fund_list, stale_navs, stock_symbols
 from tracker.calculator import (
     DEFAULT_FEE_RATE,
-    estimate_fee,
+    fee_for_trade,
     shares_to_trim,
     simulate_dca,
     simulate_sell,
@@ -286,8 +286,10 @@ def transaction_dialog(txn: dict | None, nonce: int, funds) -> None:
         f"Fee ({CCY})", min_value=0.0, step=0.01, format="%.2f", placeholder="auto",
         value=float(txn["fee"]) if editing else None, key=f"{p}fee",
     )
-    auto_fee = estimate_fee(quantity or 0, unit_price or 0)
-    if quantity and unit_price:
+    auto_fee = fee_for_trade(quantity or 0, unit_price or 0, is_fund)
+    if is_fund:
+        st.caption(f"Fund: no fee. Left empty → **0.00 {CCY}**.")
+    elif quantity and unit_price:
         st.caption(
             f"Fee left empty → **{auto_fee:,.2f} {CCY}** ({DEFAULT_FEE_RATE * 100:.3f}% of "
             f"{quantity * unit_price:,.2f})."
@@ -1080,7 +1082,7 @@ with tab_dividends:
 
 
 # --- Buy / Sell planner tab ----------------------------------------------------
-def sell_planner(held: dict, saved_prices: dict) -> None:
+def sell_planner(held: dict, saved_prices: dict, funds) -> None:
     st.caption(
         "Simulate selling or trimming: cash you'd receive, profit locked in, what's left, "
         "and how your break-even and wallet share change."
@@ -1116,7 +1118,7 @@ def sell_planner(held: dict, saved_prices: dict) -> None:
             st.caption(f"→ sell **{sell_qty:,}** shares")
         fee = st.number_input(
             f"Fee ({CCY})", min_value=0.0, step=1.0, value=None, placeholder="auto", key="sell_fee",
-            help=f"Total brokerage fee for this sale. Empty = {DEFAULT_FEE_RATE * 100:.3f}% of the trade value.",
+            help=f"Total brokerage fee for this sale. Empty = {DEFAULT_FEE_RATE * 100:.3f}% of the trade value (0 for funds).",
         )
         st.caption(
             f"Current position: **{p.quantity:,}** shares · broker avg **{price(p.broker_avg)}** · "
@@ -1133,7 +1135,7 @@ def sell_planner(held: dict, saved_prices: dict) -> None:
 
         r = simulate_sell(
             p.quantity, p.broker_avg, p.net_invested, sell_price, sell_qty,
-            fee if fee else estimate_fee(sell_qty, sell_price),
+            fee if fee else fee_for_trade(sell_qty, sell_price, sym in funds),
         )
         value_before = p.quantity * sell_price
         value_after = r.new_qty * sell_price
@@ -1170,7 +1172,7 @@ def sell_planner(held: dict, saved_prices: dict) -> None:
         q = max(1, min(p.quantity, round(p.quantity * frac)))
         s = simulate_sell(
             p.quantity, p.broker_avg, p.net_invested, sell_price, q,
-            fee if fee else estimate_fee(q, sell_price),
+            fee if fee else fee_for_trade(q, sell_price, sym in funds),
         )
         left_value = s.new_qty * sell_price
         rows.append(
@@ -1203,7 +1205,7 @@ def sell_planner(held: dict, saved_prices: dict) -> None:
 
 
 @st.fragment
-def dca_tab(positions, saved_prices: dict) -> None:
+def dca_tab(positions, saved_prices: dict, funds) -> None:
     held = {p.symbol: p for p in positions if p.quantity > 0}
     if not held:
         st.info("No open positions to plan with.")
@@ -1214,7 +1216,7 @@ def dca_tab(positions, saved_prices: dict) -> None:
         label_visibility="collapsed",
     )
     if action == "Sell / trim":
-        sell_planner(held, saved_prices)
+        sell_planner(held, saved_prices, funds)
         return
 
     st.caption(
@@ -1249,7 +1251,7 @@ def dca_tab(positions, saved_prices: dict) -> None:
             st.caption(f"≈ {add_qty:,} shares")
         fee = st.number_input(
             f"Fee ({CCY})", min_value=0.0, step=1.0, value=None, placeholder="auto", key="dca_fee",
-            help=f"Total brokerage fee for this buy. Empty = {DEFAULT_FEE_RATE * 100:.3f}% of the trade value.",
+            help=f"Total brokerage fee for this buy. Empty = {DEFAULT_FEE_RATE * 100:.3f}% of the trade value (0 for funds).",
         )
         st.caption(
             f"Current position: **{p.quantity:,}** shares · broker avg **{price(p.broker_avg)}** · "
@@ -1266,7 +1268,7 @@ def dca_tab(positions, saved_prices: dict) -> None:
 
         r = simulate_dca(
             p.quantity, p.broker_avg, p.net_invested, buy_price, add_qty,
-            fee if fee else estimate_fee(add_qty, buy_price),
+            fee if fee else fee_for_trade(add_qty, buy_price, sym in funds),
         )
 
         def delta_pp(v: float | None) -> str | None:
@@ -1346,7 +1348,7 @@ def dca_tab(positions, saved_prices: dict) -> None:
         q = max(1, round(p.quantity * mult))
         s = simulate_dca(
             p.quantity, p.broker_avg, p.net_invested, buy_price, q,
-            fee if fee else estimate_fee(q, buy_price),
+            fee if fee else fee_for_trade(q, buy_price, sym in funds),
         )
         imp = s.broker_pct_improvement
         rows.append(
@@ -1384,7 +1386,7 @@ def dca_tab(positions, saved_prices: dict) -> None:
 
 
 with tab_dca:
-    dca_tab(positions, saved_prices)
+    dca_tab(positions, saved_prices, frozenset(fund_symbols))
 
 
 # --- Performance tab ------------------------------------------------------------

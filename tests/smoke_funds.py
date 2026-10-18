@@ -91,6 +91,26 @@ assert not funds_now & set(hist_requested), "a fund was sent to the EODHD histor
 assert "ARCC" in hist_requested or "ABUK" in hist_requested
 assert "EGX30.INDX" in hist_requested
 
+# the planner must use a ZERO default fee for a fund (and the normal 0.028% for a stock)
+def dca_cost(symbol, price):
+    at.selectbox(key="dca_symbol").select(symbol).run()
+    at.number_input(key=f"dca_price_{symbol}").set_value(price).run()
+    assert not at.exception, [str(e.value) for e in at.exception]
+    return next(m.value for m in at.metric if m.label == "Cost of this buy")
+
+
+bal_pos = 1000                                  # the open BAL position in this throwaway DB
+bal_shares = max(1, bal_pos // 4)               # planner default = a quarter of the holding
+cost_fund = dca_cost("BAL", 1.5)
+print("DCA on fund BAL   : cost =", cost_fund, "(expected exactly", f"{bal_shares * 1.5:,.2f} EGP, no fee)")
+assert cost_fund == f"{bal_shares * 1.5:,.2f} EGP", cost_fund
+stock_shares = None
+cost_stock = dca_cost("ABUK", 100.0)
+stock_qty = int(next(n for n in at.number_input if n.key == "dca_qty_ABUK").value)
+expected_stock = stock_qty * 100.0 * 1.00028
+print("DCA on stock ABUK : cost =", cost_stock, "(expected", f"{expected_stock:,.2f} EGP, incl. 0.028% fee)")
+assert cost_stock == f"{expected_stock:,.2f} EGP", cost_stock
+
 # flag another symbol as a fund through the UI picker and confirm it is persisted
 picker = next(m for m in at.multiselect if m.key and m.key.startswith("fund_picker_"))
 picker.set_value(["BAL", "FWRY"]).run()

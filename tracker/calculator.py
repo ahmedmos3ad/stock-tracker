@@ -148,3 +148,8 @@ DEFAULT_FEE_RATE = 0.00028  # ~0.028% of trade value, the usual fee on EGX trade
 def estimate_fee(qty: float, price: float, rate: float = DEFAULT_FEE_RATE) -> float:
     """Estimated brokerage fee for a trade: ``rate`` x quantity x price, to the piastre."""
     return round(max(qty, 0) * max(price, 0) * rate, 2)
+
+
+def fee_for_trade(qty: float, price: float, is_fund: bool = False) -> float:
+    """Default fee for a trade: funds carry no fee, stocks use the standard estimate."""
+    return 0.0 if is_fund else estimate_fee(qty, price)

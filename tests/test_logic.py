@@ -9,7 +9,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tracker.actions import apply_corporate_actions, resolve_actions
-from tracker.calculator import DEFAULT_FEE_RATE, estimate_fee, shares_to_trim, simulate_dca, simulate_sell
+from tracker.calculator import (
+    DEFAULT_FEE_RATE, estimate_fee, fee_for_trade, shares_to_trim, simulate_dca, simulate_sell,
+)
 from tracker.performance import (
     cash_flows,
     deposit_equivalent,
@@ -234,7 +236,7 @@ class AppStructureTests(unittest.TestCase):
     def test_dialogs_do_not_read_late_bound_globals(self):
         # Streamlit re-runs a dialog on its own, without re-executing the script. A dialog that reads a
         # module global assigned later in the script (like the fund list) crashes with NameError.
-        for fn in ("_company_picker", "transaction_dialog", "dividend_dialog"):
+        for fn in ("_company_picker", "transaction_dialog", "dividend_dialog", "sell_planner", "dca_tab"):
             self.assertNotIn("fund_symbols", self._names(self.funcs[fn]), f"{fn} reads the global fund_symbols")
 
     def test_every_eodhd_call_is_guarded_against_funds(self):
@@ -258,6 +260,13 @@ class AppStructureTests(unittest.TestCase):
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in callers:
                 owner = next((nm for nm, f in self.funcs.items() if n in ast.walk(f)), None)
                 self.assertIn(owner, {"_fetch_close", "_fetch_hist"}, f"unguarded call to {n.func.id}")
+
+
+class FundFeeTests(unittest.TestCase):
+    def test_fund_trades_default_to_zero_fee(self):
+        self.assertEqual(fee_for_trade(1000, 10.0, is_fund=True), 0.0)
+        self.assertEqual(fee_for_trade(1000, 10.0, is_fund=False), 2.8)
+        self.assertEqual(fee_for_trade(1000, 10.0), 2.8)  # stock is the default
 
 
 class CurveAndBenchmarkTests(unittest.TestCase):
