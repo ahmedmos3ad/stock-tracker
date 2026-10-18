@@ -904,6 +904,30 @@ def prices_tab(
         else:
             st.toast("No price changes to save.")
 
+    # --- indexes (manual benchmark level, used by the Performance tab comparison) -------------
+    st.markdown("##### Indexes")
+    with st.form("indexes_form", border=False):
+        idx_col, _ = st.columns([1, 3])
+        with idx_col:
+            st.markdown("**EGX30**  ·  index level")
+            saved_idx = saved_prices.get(EGX30_SYMBOL)
+            st.number_input(
+                "EGX30 level", min_value=0.0, step=0.01, format="%.2f",
+                value=float(saved_idx) if saved_idx else None, placeholder="0.00",
+                key="index_egx30", label_visibility="collapsed",
+            )
+            st.caption(freshness_label(saved_price_entries.get(EGX30_SYMBOL, {}).get("updated_at")))
+        save_index = st.form_submit_button("Save index", type="primary")
+    st.caption("Enter the level once a day (e.g. at the close); the Performance tab compares you against it.")
+    if save_index:
+        level = st.session_state.get("index_egx30")
+        if level and level != saved_prices.get(EGX30_SYMBOL):
+            store.set_price(EGX30_SYMBOL, level, cairo_now().isoformat(timespec="seconds"))
+            st.session_state["toast"] = "Saved EGX30 level."
+            st.rerun()
+        else:
+            st.toast("No index change to save.")
+
 
 # --- Transactions tab --------------------------------------------------------
 def _side_css(val: str) -> str:
@@ -1495,7 +1519,10 @@ def perf_tab(positions, adj_txns, dividends, history, price_entries) -> None:
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date")
     stamps = [str(e["updated_at"])[:10] for e in price_entries.values() if e.get("updated_at")]
-    components.html(card_html(df, max(stamps) if stamps else today, CCY), height=CARD_HEIGHT)
+    components.html(
+        card_html(df, max(stamps) if stamps else today, CCY, index_history=curve_history.get(EGX30_SYMBOL)),
+        height=CARD_HEIGHT,
+    )
     priced_days = len({d for s in held_symbols for d, _ in history.get(s, [])})
     st.caption(
         f"Gap between the lines = trading profit (dividends excluded). Built from {priced_days:,} days of saved "

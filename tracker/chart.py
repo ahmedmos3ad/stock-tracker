@@ -12,23 +12,48 @@ and switching ranges is instant and never reruns the app.
 from __future__ import annotations
 
 import json
+from bisect import bisect_right
 
 import pandas as pd
 
-HEIGHT = 520
+HEIGHT = 560
 
 
-def card_html(df: pd.DataFrame, last_updated: str, ccy: str = "EGP", default_range: str = "1M") -> str:
-    """``df``: daily rows indexed by datetime with ``value`` and ``contributed`` columns."""
-    points = [
-        {"d": idx.strftime("%Y-%m-%d"), "v": round(float(r["value"]), 2), "c": round(float(r["contributed"]), 2)}
-        for idx, r in df.iterrows()
-    ]
+def card_html(
+    df: pd.DataFrame,
+    last_updated: str,
+    ccy: str = "EGP",
+    index_history: list[tuple[str, float]] | None = None,
+    default_range: str = "1M",
+) -> str:
+    """``df``: daily rows indexed by datetime with ``value`` and ``contributed`` columns.
+
+    ``index_history``: [(iso date, close)] of the benchmark (EGX30). Each day also gets ``g``, the
+    portfolio's chained time-weighted growth factor (deposits/withdrawals don't count as gains),
+    and ``x``, the index level (carried forward over non-trading days), so the card can show
+    "you vs the index" for any range and hovered day.
+    """
+    idx = sorted(index_history or [])
+    idx_dates = [d for d, _ in idx]
+    points = []
+    g, prev_v, prev_c = 1.0, 0.0, 0.0
+    for ts, r in df.iterrows():
+        v, c = float(r["value"]), float(r["contributed"])
+        if prev_v > 0:
+            g *= (v - (c - prev_c)) / prev_v
+        prev_v, prev_c = v, c
+        iso = ts.strftime("%Y-%m-%d")
+        k = bisect_right(idx_dates, iso) - 1
+        points.append({
+            "d": iso, "v": round(v, 2), "c": round(c, 2), "g": round(g, 6),
+            "x": idx[k][1] if k >= 0 else None,
+        })
     return (
         _TEMPLATE.replace("__DATA__", json.dumps(points))
         .replace("__UPDATED__", json.dumps(last_updated))
         .replace("__CCY__", json.dumps(ccy))
         .replace("__RANGE__", json.dumps(default_range))
+        .replace("__HASIDX__", "true" if len(idx) >= 2 else "false")
     )
 
 
@@ -51,6 +76,9 @@ _TEMPLATE = r"""
   .side>div+div{border-left:1px solid #2b2f36;padding-right:0}
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:middle}
   .side b{display:block;font-weight:500;margin-top:6px;color:#fff}
+  .cmp{display:flex;gap:22px;flex-wrap:wrap;margin-top:12px;font-size:.95rem;color:#8a8f98}
+  .cmp b{font-weight:600;margin-left:6px}
+  .up{color:#7ed957}.down{color:#ff4d6a}
   #plot{position:relative;margin-top:10px}
   svg{display:block;width:100%;overflow:visible}
   #tip{position:absolute;pointer-events:none;background:#2a2d33;border-radius:6px;padding:10px 14px;
@@ -75,12 +103,13 @@ _TEMPLATE = r"""
       <div><span class="dot" style="background:#8c8cff"></span><span class="lbl">Net Deposits</span><b id="sc"></b></div>
     </div>
   </div>
+  <div class="cmp" id="cmp"></div>
   <div id="plot"><svg id="svg"></svg><div id="tip"></div></div>
   <div class="pills" id="pills"></div>
 </div>
 <script>
 const D = __DATA__.map(p => ({...p, t: Date.parse(p.d + "T00:00:00Z"), r: p.v - p.c}));
-const CCY = __CCY__, GREEN = "#7ed957", RED = "#ff4d6a", PURPLE = "#8c8cff", BG = "#0e1117";
+const HAS_IDX = __HASIDX__, CCY = __CCY__, GREEN = "#7ed957", RED = "#ff4d6a", PURPLE = "#8c8cff", BG = "#0e1117";
 const RANGES = ["1D", "1M", "6M", "1Y", "YTD", "All"];
 let view = "returns", range = __RANGE__, hover = null, pts = [];
 const H = 300, M = {l: 46, r: 6, t: 8, b: 8};
@@ -134,8 +163,23 @@ function smoothPath(xy) {
   }
   return d;
 }
+function pct(x) { return (x >= 0 ? "+" : "\u2212") + Math.abs(x * 100).toFixed(2) + "%"; }
+function cmpHtml(label, x) { return `<span>${label}<b class="${x >= 0 ? "up" : "down"}">${pct(x)}</b></span>`; }
+function setCompare(p, first) {
+  const me = p.g / first.g - 1;
+  let h = cmpHtml("You", me);
+  if (p.x != null && first.x != null && HAS_IDX) {
+    const ix = p.x / first.x - 1, diff = (me - ix) * 100;
+    h += cmpHtml("EGX30", ix) +
+         `<span>vs EGX30<b class="${diff >= 0 ? "up" : "down"}">${(diff >= 0 ? "+" : "\u2212") + Math.abs(diff).toFixed(2)} pp</b></span>`;
+  } else {
+    h += `<span>EGX30: enter its level in the Prices tab on 2+ different days to compare</span>`;
+  }
+  $("cmp").innerHTML = h;
+}
 function setHeader() {
   const i = hover === null ? pts.length - 1 : hover, p = pts[i], first = pts[0];
+  setCompare(p, first);
   if (view === "returns") {
     $("lbl").textContent = "Returns Value"; $("big").textContent = money(p.r - first.r);
     $("side").style.display = "none";
