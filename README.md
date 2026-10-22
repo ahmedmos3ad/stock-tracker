@@ -1,6 +1,6 @@
 # Portfolio & Stock Tracker
 
-A local dashboard to track your **EGX / THNDR stock positions** alongside your full **Net Worth** in **EGP** (US / Employer Stock like `PCOR`, Mutual Funds, Gold bars & pounds, Foreign Currency, and EGP/USD Certificates of Deposit).
+A local dashboard to track your **EGX / THNDR stock positions** alongside your full **Net Worth** in **EGP** (US / Employer Stock, Mutual Funds, Gold bars & pounds, Foreign Currency, and EGP/USD Certificates of Deposit).
 
 Its core stock engine solves a specific problem: brokers like THNDR use a *moving weighted-average* cost. When you sell high and re-buy lower to "fix" your average (DCA), the broker's displayed average drifts down and no longer reflects reality. This app stores every transaction in a single SQLite file (`portfolio.db`) and shows several views of each position side by side so you always know your *true* cost.
 
