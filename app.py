@@ -53,7 +53,9 @@ from tracker.networth import (
     CD_CURRENCIES,
     COMMON_CURRENCIES,
     GOLD_PRESETS,
+    NW_CHART_HEIGHT,
     NetWorthItem,
+    build_snapshot_series,
     compute_net_worth,
     effective_fx_rate,
     effective_gold_prices,
@@ -62,6 +64,8 @@ from tracker.networth import (
     item_currency,
     item_native_value,
     item_value_egp,
+    nw_chart_html,
+    snapshot_from_nw,
 )
 from tracker.portfolio import Dividend
 from tracker.prices import fetch_latest_eodhd_close
@@ -81,7 +85,7 @@ st.set_page_config(page_title="Portfolio & Stock Tracker", page_icon=":chart_wit
 
 
 @st.cache_resource
-def get_store(_schema_version: int = 4) -> Store:
+def get_store(_schema_version: int = 5) -> Store:
     s = Store()
     s.data_version = 0
 
@@ -99,6 +103,7 @@ def get_store(_schema_version: int = 4) -> Store:
         "add_dividend", "update_dividend", "delete_dividend", "set_price",
         "add_corporate_action", "delete_corporate_action", "upsert_price_history", "set_fund",
         "set_setting", "add_net_worth_item", "update_net_worth_item", "delete_net_worth_item",
+        "upsert_net_worth_snapshot", "delete_net_worth_snapshot",
     ):
         setattr(s, name, _invalidating(getattr(s, name)))
     return s
@@ -124,6 +129,7 @@ def load_data(version: int, db_mtime_ns: int):
         store.fund_symbols(),
         store.settings(),
         store.list_net_worth_items(),
+        store.list_net_worth_snapshots(),
     )
 
 if "price_sync_message" not in st.session_state:
@@ -391,7 +397,7 @@ if "toast" in st.session_state:
 
 (
     all_txn_rows, all_dividend_rows, saved_prices, saved_price_entries,
-    all_action_rows, price_history, fund_rows, settings_rows, all_nw_rows,
+    all_action_rows, price_history, fund_rows, settings_rows, all_nw_rows, all_nw_snapshots,
 ) = load_data(store.data_version, os.stat(store.db_path).st_mtime_ns)
 fund_symbols = set(fund_rows)  # symbols flagged as funds: priced by hand, never synced from EODHD
 app_settings = dict(settings_rows)  # persisted preferences (deposit rate, size limit, ...)
@@ -414,9 +420,39 @@ def live_funds() -> set:
     return set(store.fund_symbols())
 
 
+def record_current_snapshot(today_iso: str | None = None) -> dict:
+    """Compute live Net Worth directly from the DB and upsert today's daily snapshot."""
+    raw_txns = store.transactions()
+    adj = apply_corporate_actions(raw_txns, store.list_corporate_actions())
+    pos = compute_positions(adj, dividends=store.dividends(), prices=store.prices())
+    funds = set(store.fund_symbols())
+    items = store.net_worth_items()
+    cfg = store.settings()
+
+    def _cfg_f(k: str) -> float:
+        try:
+            return float(cfg[k])
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+
+    p24, p21 = effective_gold_prices(_cfg_f("gold_24k_price"), _cfg_f("gold_21k_price"))
+    usd_r = _cfg_f("usd_egp_rate")
+    nw = compute_net_worth(pos, funds, items, p24, p21, usd_r)
+    snap = snapshot_from_nw(today_iso or cairo_today().isoformat(), nw)
+    if snap["total_egp"] > 0:
+        store.upsert_net_worth_snapshot(snap)
+    return snap
+
+
 def _save_setting(widget_key: str, setting_key: str) -> None:
     """on_change callback: write the widget's new value to the database."""
     store.set_setting(setting_key, st.session_state[widget_key])
+
+
+def _save_nw_setting(widget_key: str, setting_key: str) -> None:
+    """on_change callback for Net Worth rates (gold / USD): save setting and update today's snapshot."""
+    store.set_setting(setting_key, st.session_state[widget_key])
+    record_current_snapshot()
 txns = [
     Transaction(
         symbol=r["symbol"], side=r["side"], quantity=int(r["quantity"]),
@@ -863,6 +899,8 @@ def prices_tab(
                     unchanged.append(sym)
             status.update(label="Sync complete", state="complete")
 
+        if updated or unchanged:
+            record_current_snapshot(timestamp[:10])
         parts: list[str] = []
         if updated:
             parts.append(f"Updated {len(updated)} stock(s): {', '.join(updated)}.")
@@ -930,6 +968,7 @@ def prices_tab(
                 store.set_price(sym, new_price, timestamp)
                 changed += 1
         if changed:
+            record_current_snapshot(timestamp[:10])
             st.session_state["toast"] = f"Saved {changed} price(s)."
             st.rerun()
         else:
@@ -2085,12 +2124,164 @@ def net_worth_dialog(
                 store.update_net_worth_item(
                     int(item["id"]), category, name, quantity, unit_value, karat, grams, notes, currency, fx_rate
                 )
+                record_current_snapshot()
                 st.session_state["toast"] = f"Updated {name}."
             else:
                 store.add_net_worth_item(
                     category, name, quantity, unit_value, karat, grams, notes, currency, fx_rate
                 )
+                record_current_snapshot()
                 st.session_state["toast"] = f"Added {name} to Net Worth."
+            st.rerun()
+
+
+@st.dialog("📸 Net Worth Snapshot / Backfill", width="large")
+def nw_snapshot_dialog(
+    nonce: int,
+    live_nw: dict,
+    eq_by_date: dict[str, float],
+    saved_by_date: dict[str, dict],
+) -> None:
+    """Save today's Net Worth snapshot or backfill/edit any historical date."""
+    p = f"nwsnap{nonce}_"
+    today_d = cairo_today()
+    today_iso = today_d.isoformat()
+
+    snap_date = st.date_input(
+        "Snapshot date",
+        value=today_d,
+        max_value=today_d,
+        key=f"{p}date",
+        help="Pick today to record your current live Net Worth, or pick any past date (e.g. end of last month) to backfill.",
+    )
+    iso = snap_date.isoformat()
+
+    live_snap = snapshot_from_nw(iso, live_nw)
+    existing = saved_by_date.get(iso)
+
+    if existing is not None:
+        defaults = existing
+        st.caption(
+            f"📌 **Saved snapshot found for `{iso}`.** You can review or edit its breakdown below, then click **Save Snapshot** to overwrite."
+        )
+    elif iso == today_iso:
+        defaults = live_snap
+        st.caption(
+            f"✨ **Today (`{iso}`):** pre-filled with your current live Net Worth across all 6 asset classes."
+        )
+    else:
+        # Backfilling a historical date: look up historical EGX portfolio value on or before `iso`
+        hist_eq = eq_by_date.get(iso)
+        if hist_eq is None and eq_by_date:
+            earlier = [d for d in eq_by_date if d <= iso]
+            hist_eq = eq_by_date[max(earlier)] if earlier else 0.0
+        defaults = dict(live_snap)
+        defaults["stocks_egp"] = round(float(hist_eq or 0.0), 2)
+        st.caption(
+            f"🕰 **Backfilling `{iso}`:** **EGX Equities** auto-filled from your portfolio history on `{iso}` "
+            f"(**{defaults['stocks_egp']:,.0f} {CCY}**). Other slices are pre-filled with your current holdings — adjust any that differed on `{iso}`."
+        )
+
+    c1, c2 = st.columns(2)
+    stocks_v = float(
+        c1.number_input(
+            f"📈 EGX Equities — Stocks & Stock Funds ({CCY})",
+            min_value=0.0,
+            step=1000.0,
+            format="%.2f",
+            value=float(defaults.get("stocks_egp", 0.0)),
+            key=f"{p}{iso}_stocks",
+        )
+    )
+    us_stocks_v = float(
+        c2.number_input(
+            f"🌎 US / Employer Stock — e.g. PCOR ({CCY})",
+            min_value=0.0,
+            step=1000.0,
+            format="%.2f",
+            value=float(defaults.get("us_stocks_egp", 0.0)),
+            key=f"{p}{iso}_us_stocks",
+        )
+    )
+    c3, c4 = st.columns(2)
+    funds_v = float(
+        c3.number_input(
+            f"📊 Mutual Funds ({CCY})",
+            min_value=0.0,
+            step=1000.0,
+            format="%.2f",
+            value=float(defaults.get("funds_egp", 0.0)),
+            key=f"{p}{iso}_funds",
+        )
+    )
+    gold_v = float(
+        c4.number_input(
+            f"🪙 Gold ({CCY})",
+            min_value=0.0,
+            step=1000.0,
+            format="%.2f",
+            value=float(defaults.get("gold_egp", 0.0)),
+            key=f"{p}{iso}_gold",
+        )
+    )
+    c5, c6 = st.columns(2)
+    fx_v = float(
+        c5.number_input(
+            f"💵 Foreign Currency Cash ({CCY})",
+            min_value=0.0,
+            step=1000.0,
+            format="%.2f",
+            value=float(defaults.get("fx_egp", 0.0)),
+            key=f"{p}{iso}_fx",
+        )
+    )
+    cd_cash_v = float(
+        c6.number_input(
+            f"🏦 CDs & Cash ({CCY})",
+            min_value=0.0,
+            step=1000.0,
+            format="%.2f",
+            value=float(defaults.get("cd_cash_egp", 0.0)),
+            key=f"{p}{iso}_cd_cash",
+        )
+    )
+    usd_total_v = float(
+        st.number_input(
+            f"🇺🇸 Total USD Exposure included above (in {CCY}, optional)",
+            min_value=0.0,
+            step=1000.0,
+            format="%.2f",
+            value=float(defaults.get("usd_total_egp", 0.0)),
+            key=f"{p}{iso}_usd_total",
+        )
+    )
+
+    total_v = round(stocks_v + us_stocks_v + funds_v + gold_v + fx_v + cd_cash_v, 2)
+    st.markdown(f"**Snapshot Total on `{iso}`:** `{total_v:,.2f} {CCY}`")
+
+    if st.button(
+        f"💾 Save Snapshot for {iso}",
+        type="primary",
+        use_container_width=True,
+        key=f"{p}save",
+    ):
+        if total_v <= 0:
+            st.error("Total Net Worth must be greater than zero.")
+        else:
+            store.upsert_net_worth_snapshot(
+                {
+                    "date": iso,
+                    "total_egp": total_v,
+                    "stocks_egp": stocks_v,
+                    "us_stocks_egp": us_stocks_v,
+                    "funds_egp": funds_v,
+                    "gold_egp": gold_v,
+                    "fx_egp": fx_v,
+                    "cd_cash_egp": cd_cash_v,
+                    "usd_total_egp": usd_total_v,
+                }
+            )
+            st.session_state["toast"] = f"Saved Net Worth snapshot for {iso} ({total_v:,.0f} {CCY})."
             st.rerun()
 
 
@@ -2214,7 +2405,15 @@ def _nw_bars_html(nw: dict, meta_by_key: dict[str, str]) -> str:
 
 
 @st.fragment
-def net_worth_tab(positions, funds: set, nw_rows: list[dict]) -> None:
+def net_worth_tab(
+    positions,
+    funds: set,
+    nw_rows: list[dict],
+    nw_snapshots: list[dict],
+    adj_txns,
+    history: dict,
+    price_entries: dict,
+) -> None:
     st.markdown(PORTFOLIO_CSS, unsafe_allow_html=True)
     items = [
         NetWorthItem(
@@ -2237,8 +2436,8 @@ def net_worth_tab(positions, funds: set, nw_rows: list[dict]) -> None:
         "**Stocks (EGX)** and **Mutual Funds** sync automatically from your portfolio."
     )
 
-    # --- Gold gram prices + USD/EGP rate + Add button ---------------------------------
-    g1, g2, g3, g4 = st.columns([1.1, 1.1, 1.1, 1.1], vertical_alignment="bottom")
+    # --- Gold gram prices + USD/EGP rate + Action buttons ------------------------------
+    g1, g2, g3, g4, g5 = st.columns([1.05, 1.05, 1.05, 1.15, 1.05], vertical_alignment="bottom")
     raw_24k = g1.number_input(
         f"🪙 24K Gold ({CCY} / g)",
         min_value=0.0,
@@ -2246,7 +2445,7 @@ def net_worth_tab(positions, funds: set, nw_rows: list[dict]) -> None:
         format="%.2f",
         value=setting_float("gold_24k_price", 0.0),
         key="nw_gold_24k",
-        on_change=_save_setting,
+        on_change=_save_nw_setting,
         args=("nw_gold_24k", "gold_24k_price"),
         help="Used to value 24K gold bars. If 21K is left at 0, 21K is auto-calculated as 24K × 21/24.",
     )
@@ -2257,7 +2456,7 @@ def net_worth_tab(positions, funds: set, nw_rows: list[dict]) -> None:
         format="%.2f",
         value=setting_float("gold_21k_price", 0.0),
         key="nw_gold_21k",
-        on_change=_save_setting,
+        on_change=_save_nw_setting,
         args=("nw_gold_21k", "gold_21k_price"),
         help="Used to value 21K Gold Pounds. Leave at 0 to auto-derive from 24K (or enter only 21K to derive 24K).",
     )
@@ -2268,20 +2467,36 @@ def net_worth_tab(positions, funds: set, nw_rows: list[dict]) -> None:
         format="%.2f",
         value=setting_float("usd_egp_rate", 0.0),
         key="nw_usd_rate",
-        on_change=_save_setting,
+        on_change=_save_nw_setting,
         args=("nw_usd_rate", "usd_egp_rate"),
         help="Exchange rate applied to all USD cash balances and USD Certificates of Deposit. Saved automatically.",
     )
     p24, p21 = effective_gold_prices(raw_24k, raw_21k)
+    nw = compute_net_worth(positions, funds, items, p24, p21, usd_rate)
+    today_iso = cairo_today().isoformat()
+
     if g4.button("➕ Add Net Worth Item", type="primary", use_container_width=True, key="nw_add_btn"):
         net_worth_dialog(None, _new_dialog_nonce(), p24, p21, usd_rate)
+    if g5.button(
+        "📸 Snapshot / Backfill",
+        use_container_width=True,
+        key="nw_snap_btn",
+        help="Save today's Net Worth snapshot or backfill/edit any historical date.",
+    ):
+        curve_history = {s: dict(pts) for s, pts in history.items()}
+        for s, e in price_entries.items():
+            curve_history.setdefault(s, {})[str(e["updated_at"])[:10]] = float(e["current_price"])
+        curve_history_sorted = {s: sorted(d.items()) for s, d in curve_history.items()}
+        eq_curve = perf.equity_curve(adj_txns, curve_history_sorted, end=today_iso)
+        eq_by_date = {pt["date"]: float(pt["value"]) for pt in eq_curve}
+        saved_by_date = {str(r["date"])[:10]: dict(r) for r in nw_snapshots}
+        nw_snapshot_dialog(_new_dialog_nonce(), nw, eq_by_date, saved_by_date)
 
     if (raw_24k > 0 and raw_21k == 0) or (raw_21k > 0 and raw_24k == 0):
         st.caption(
             f"Active gold prices: **24K = {p24:,.2f} {CCY}/g** · **21K = {p21:,.2f} {CCY}/g** *(auto-derived by karat ratio)*"
         )
 
-    nw = compute_net_worth(positions, funds, items, p24, p21, usd_rate)
     by_k = nw["by_key"]
     tot = nw["total"] or 1.0
     equities_val = by_k["stocks"]
@@ -2352,6 +2567,60 @@ def net_worth_tab(positions, funds: set, nw_rows: list[dict]) -> None:
         st.markdown(_nw_donut_html(nw), unsafe_allow_html=True)
     with bars_col:
         st.markdown(_nw_bars_html(nw, meta_by_key), unsafe_allow_html=True)
+
+    # --- Net Worth Over Time (Snapshots Chart) ----------------------------------------
+    series = build_snapshot_series(nw_snapshots, today_iso, nw)
+    if series:
+        components.html(nw_chart_html(series, CCY), height=NW_CHART_HEIGHT)
+        st.caption(
+            "Snapshots are saved automatically whenever you sync/save stock prices or update Net Worth items & rates "
+            "(one point per day — same-day edits overwrite that day's snapshot). "
+            "Use **📸 Snapshot / Backfill** above to record or backfill any historical date."
+        )
+        if nw_snapshots:
+            with st.expander(f"🗂 Saved Snapshots ({len(nw_snapshots)}) — view or delete"):
+                snap_rows = [
+                    {
+                        "Date": r["date"],
+                        f"Total ({CCY})": float(r["total_egp"]),
+                        f"EGX Equities ({CCY})": float(r["stocks_egp"]),
+                        f"US Stock ({CCY})": float(r["us_stocks_egp"]),
+                        f"Mutual Funds ({CCY})": float(r["funds_egp"]),
+                        f"Gold ({CCY})": float(r["gold_egp"]),
+                        f"FX Cash ({CCY})": float(r["fx_egp"]),
+                        f"CDs & Cash ({CCY})": float(r["cd_cash_egp"]),
+                        f"USD Exposure ({CCY})": float(r.get("usd_total_egp", 0.0)),
+                    }
+                    for r in reversed(nw_snapshots)
+                ]
+                snap_df = pd.DataFrame(snap_rows)
+                snap_evt = st.dataframe(
+                    snap_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="nw_snap_table",
+                    column_config={
+                        col: st.column_config.NumberColumn(format="%.0f")
+                        for col in snap_df.columns
+                        if col != "Date"
+                    },
+                )
+                sel_snap = snap_evt.selection.rows
+                if sel_snap:
+                    chosen_snap = snap_rows[sel_snap[0]]
+                    del_s_col, _ = st.columns([1.2, 4])
+                    if del_s_col.button(
+                        f"🗑 Delete snapshot {chosen_snap['Date']}",
+                        key="nw_del_snap_btn",
+                        use_container_width=True,
+                    ):
+                        store.delete_net_worth_snapshot(str(chosen_snap["Date"]))
+                        st.session_state["toast"] = f"Deleted snapshot for {chosen_snap['Date']}."
+                        st.rerun()
+                else:
+                    st.caption("Select a snapshot row above to delete it, or click **📸 Snapshot / Backfill** to edit any date.")
 
     # --- Non-Stock Holdings Table (US Stock, Mutual Funds, Gold, FX, CDs, Cash) -------
     st.subheader("Manual Holdings (US Stock, Mutual Funds, Gold, FX, CDs & Cash)")
@@ -2453,10 +2722,14 @@ def net_worth_tab(positions, funds: set, nw_rows: list[dict]) -> None:
         st.write(f"Delete **{chosen_row['name']}**?")
         if st.button("Confirm delete", type="primary", key="nw_confirm_delete"):
             store.delete_net_worth_item(int(chosen_row["id"]))
+            record_current_snapshot()
             st.session_state["toast"] = f"Deleted {chosen_row['name']}."
             st.rerun()
 
 
 with tab_networth:
-    net_worth_tab(positions, fund_symbols, all_nw_rows)
+    net_worth_tab(
+        positions, fund_symbols, all_nw_rows, all_nw_snapshots,
+        adj_txns, price_history, saved_price_entries,
+    )
 

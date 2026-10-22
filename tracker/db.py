@@ -98,6 +98,18 @@ class Store:
                 fx_rate    REAL    NOT NULL DEFAULT 1.0 CHECK (fx_rate >= 0),
                 notes      TEXT    NOT NULL DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS net_worth_snapshots (
+                date          TEXT PRIMARY KEY,
+                total_egp     REAL NOT NULL,
+                stocks_egp    REAL NOT NULL DEFAULT 0,
+                us_stocks_egp REAL NOT NULL DEFAULT 0,
+                funds_egp     REAL NOT NULL DEFAULT 0,
+                gold_egp      REAL NOT NULL DEFAULT 0,
+                fx_egp        REAL NOT NULL DEFAULT 0,
+                cd_cash_egp   REAL NOT NULL DEFAULT 0,
+                usd_total_egp REAL NOT NULL DEFAULT 0
+            );
             """
             )
             nw_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(net_worth_items)")}
@@ -405,6 +417,54 @@ class Store:
             )
             for r in self.list_net_worth_items()
         ]
+
+    # --- net worth historical snapshots --------------------------------------------
+    def upsert_net_worth_snapshot(self, snap: dict) -> None:
+        """Insert or overwrite a daily net worth snapshot keyed by YYYY-MM-DD."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO net_worth_snapshots
+                    (date, total_egp, stocks_egp, us_stocks_egp, funds_egp, gold_egp, fx_egp, cd_cash_egp, usd_total_egp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    total_egp     = excluded.total_egp,
+                    stocks_egp    = excluded.stocks_egp,
+                    us_stocks_egp = excluded.us_stocks_egp,
+                    funds_egp     = excluded.funds_egp,
+                    gold_egp      = excluded.gold_egp,
+                    fx_egp        = excluded.fx_egp,
+                    cd_cash_egp   = excluded.cd_cash_egp,
+                    usd_total_egp = excluded.usd_total_egp
+                """,
+                (
+                    str(snap["date"])[:10],
+                    float(snap.get("total_egp", 0.0)),
+                    float(snap.get("stocks_egp", 0.0)),
+                    float(snap.get("us_stocks_egp", 0.0)),
+                    float(snap.get("funds_egp", 0.0)),
+                    float(snap.get("gold_egp", 0.0)),
+                    float(snap.get("fx_egp", 0.0)),
+                    float(snap.get("cd_cash_egp", 0.0)),
+                    float(snap.get("usd_total_egp", 0.0)),
+                ),
+            )
+            self._conn.commit()
+
+    def delete_net_worth_snapshot(self, date_iso: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM net_worth_snapshots WHERE date = ?",
+                (str(date_iso)[:10],),
+            )
+            self._conn.commit()
+
+    def list_net_worth_snapshots(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM net_worth_snapshots ORDER BY date"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # --- price history -------------------------------------------------------------
     def upsert_price_history(self, symbol: str, points: list[tuple[str, float]]) -> int:

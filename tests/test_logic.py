@@ -485,6 +485,64 @@ class NetWorthTests(unittest.TestCase):
         self.assertAlmostEqual(nw["egp_pct"], 200000.0 / 450000.0 * 100.0)
         self.assertAlmostEqual(nw["annual_cd_income"], 36000.0)
 
+    def test_net_worth_snapshots_crud_series_and_chart(self):
+        import tempfile
+        from tracker.db import Store
+        from tracker.networth import (
+            CAT_CD,
+            CAT_US_STOCK,
+            NetWorthItem,
+            build_snapshot_series,
+            compute_net_worth,
+            nw_chart_html,
+            snapshot_from_nw,
+        )
+
+        s = Store(Path(tempfile.mkdtemp()) / "nw_snap.db")
+        self.assertEqual(s.list_net_worth_snapshots(), [])
+
+        txns = [T("ABUK", BUY, 1000, 100.0, "2026-01-01")]
+        positions = compute_positions(txns, (), {"ABUK": 100.0})
+        items = [
+            NetWorthItem(1, CAT_US_STOCK, "PCOR", quantity=20.0, unit_value=50.0, currency="USD", fx_rate=50.0),
+            NetWorthItem(2, CAT_CD, "BM EGP CD", quantity=100000.0, unit_value=27.0, currency="EGP", fx_rate=1.0),
+        ]
+        nw_sep = compute_net_worth(positions, [], items, usd_egp_rate=50.0)
+        snap_sep = snapshot_from_nw("2026-09-30", nw_sep)
+        self.assertEqual(snap_sep["date"], "2026-09-30")
+        self.assertAlmostEqual(snap_sep["total_egp"], 250000.0)
+        self.assertAlmostEqual(snap_sep["stocks_egp"], 100000.0)
+        self.assertAlmostEqual(snap_sep["us_stocks_egp"], 50000.0)
+        self.assertAlmostEqual(snap_sep["cd_cash_egp"], 100000.0)
+
+        s.upsert_net_worth_snapshot(snap_sep)
+        # Same-day update overwrites that day's snapshot
+        snap_sep_updated = dict(snap_sep, gold_egp=25000.0, total_egp=275000.0)
+        s.upsert_net_worth_snapshot(snap_sep_updated)
+        saved = s.list_net_worth_snapshots()
+        self.assertEqual(len(saved), 1)
+        self.assertAlmostEqual(saved[0]["total_egp"], 275000.0)
+        self.assertAlmostEqual(saved[0]["gold_egp"], 25000.0)
+
+        # Live Net Worth on a later day is appended/merged into the series
+        nw_oct = compute_net_worth(
+            compute_positions(txns, (), {"ABUK": 120.0}),
+            [],
+            items,
+            usd_egp_rate=50.0,
+        )
+        series = build_snapshot_series(saved, "2026-10-22", nw_oct)
+        self.assertEqual([pt["date"] for pt in series], ["2026-09-30", "2026-10-22"])
+        self.assertAlmostEqual(series[-1]["total_egp"], 270000.0)
+        self.assertAlmostEqual(series[-1]["stocks_egp"], 120000.0)
+
+        html = nw_chart_html(series, "EGP")
+        self.assertIn("Net Worth Over Time", html)
+        self.assertIn("Stacked Breakdown", html)
+
+        s.delete_net_worth_snapshot("2026-09-30")
+        self.assertEqual(s.list_net_worth_snapshots(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

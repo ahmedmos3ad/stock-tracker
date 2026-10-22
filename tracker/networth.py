@@ -296,3 +296,287 @@ def compute_net_worth(
         "egp_pct": (egp_exposure_egp / denom * 100.0) if total > 0 else 0.0,
         "gold_pct": (gold_val / denom * 100.0) if total > 0 else 0.0,
     }
+
+
+def snapshot_from_nw(date_iso: str, nw: dict) -> dict:
+    """Convert a ``compute_net_worth`` result into a snapshot row dict keyed by ``date``."""
+    by_k = nw["by_key"]
+    return {
+        "date": str(date_iso)[:10],
+        "total_egp": float(nw["total"]),
+        "stocks_egp": float(by_k.get("stocks", 0.0)),
+        "us_stocks_egp": float(by_k.get("us_stocks", 0.0)),
+        "funds_egp": float(by_k.get("funds", 0.0)),
+        "gold_egp": float(by_k.get("gold", 0.0)),
+        "fx_egp": float(by_k.get("fx", 0.0)),
+        "cd_cash_egp": float(by_k.get("cd_cash", 0.0)),
+        "usd_total_egp": float(nw.get("usd_total_egp", 0.0)),
+    }
+
+
+def build_snapshot_series(
+    saved_snapshots: Iterable[dict],
+    today_iso: str,
+    live_nw: dict,
+) -> list[dict]:
+    """Merge persisted snapshots with today's live Net Worth so the chart always ends at today."""
+    by_date: dict[str, dict] = {}
+    for s in saved_snapshots:
+        d = str(s["date"])[:10]
+        by_date[d] = {
+            "date": d,
+            "total_egp": round(float(s["total_egp"]), 2),
+            "stocks_egp": round(float(s.get("stocks_egp", 0.0)), 2),
+            "us_stocks_egp": round(float(s.get("us_stocks_egp", 0.0)), 2),
+            "funds_egp": round(float(s.get("funds_egp", 0.0)), 2),
+            "gold_egp": round(float(s.get("gold_egp", 0.0)), 2),
+            "fx_egp": round(float(s.get("fx_egp", 0.0)), 2),
+            "cd_cash_egp": round(float(s.get("cd_cash_egp", 0.0)), 2),
+            "usd_total_egp": round(float(s.get("usd_total_egp", 0.0)), 2),
+        }
+    today_row = snapshot_from_nw(today_iso, live_nw)
+    by_date[today_row["date"]] = {
+        k: (round(v, 2) if isinstance(v, float) else v) for k, v in today_row.items()
+    }
+    return [by_date[d] for d in sorted(by_date)]
+
+
+NW_CHART_HEIGHT = 490
+
+
+def nw_chart_html(series: list[dict], ccy: str = "EGP", default_range: str = "1M") -> str:
+    """Interactive HTML/SVG card for Net Worth over time (Total line + Stacked Asset Breakdown)."""
+    import json
+
+    return (
+        _NW_CHART_TEMPLATE.replace("__DATA__", json.dumps(series))
+        .replace("__CCY__", json.dumps(ccy))
+        .replace("__RANGE__", json.dumps(default_range))
+    )
+
+
+_NW_CHART_TEMPLATE = r"""
+<style>
+  html,body{margin:0;background:transparent;color:#e6e6e6;font-family:"Source Sans Pro",system-ui,sans-serif}
+  .card{background:#1c1f26;border:1px solid #2a2e37;border-radius:14px;padding:16px 18px;user-select:none}
+  .top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+  .title{font-size:1.05rem;font-weight:700}
+  .seg button,.pills button{background:transparent;border:1px solid #2b2f36;color:#8a8f98;cursor:pointer;
+    font:inherit;font-size:.86rem;padding:5px 11px}
+  .seg button{border-radius:4px}
+  .seg button.on{background:#2a2d33;color:#fff;border-color:#4a4f5c}
+  .head{display:flex;justify-content:space-between;align-items:flex-end;margin-top:10px;min-height:54px;flex-wrap:wrap;gap:12px}
+  .lbl{color:#8a8f98;font-size:.82rem;margin-bottom:2px}
+  .big{font-size:1.75rem;line-height:1.15;font-weight:600;color:#fff}
+  .delta{font-size:.95rem;font-weight:600;margin-left:10px}
+  .up{color:#2ecc71}.down{color:#e74c3c}.flat{color:#9aa0a6}
+  #plot{position:relative;margin-top:10px}
+  svg{display:block;width:100%;overflow:visible}
+  #tip{position:absolute;pointer-events:none;background:#252932;border:1px solid #3a3f4b;border-radius:8px;
+    padding:10px 14px;font-size:.82rem;display:none;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.55);z-index:10}
+  #tip .t{color:#9aa0a6;margin-bottom:6px;font-weight:600}
+  #tip .row{display:flex;gap:14px;justify-content:space-between;padding:1px 0}
+  #tip b{color:#fff}
+  .pills{display:flex;justify-content:center;gap:8px;margin-top:14px}
+  .pills button{border:1px solid transparent;color:#9aa0a6;font-weight:600;border-radius:4px;padding:5px 11px}
+  .pills button.on{background:#2a2d33;color:#fff}
+</style>
+<div class="card">
+  <div class="top">
+    <div class="title">📈 Net Worth Over Time</div>
+    <div class="seg">
+      <button id="vTotal" class="on">Total Net Worth</button>
+      <button id="vStack">Stacked Breakdown</button>
+    </div>
+  </div>
+  <div class="head">
+    <div>
+      <div class="lbl" id="lbl">Net Worth</div>
+      <div><span class="big" id="big"></span><span class="delta" id="delta"></span></div>
+    </div>
+    <div class="lbl" id="subRight"></div>
+  </div>
+  <div id="plot"><svg id="svg"></svg><div id="tip"></div></div>
+  <div class="pills" id="pills"></div>
+</div>
+<script>
+const D = __DATA__.map(p => ({...p, t: Date.parse(p.date + "T00:00:00Z")}));
+const CCY = __CCY__, GREEN = "#2ecc71", RED = "#e74c3c", BG = "#1c1f26";
+const SLICES = [
+  {k: "cd_cash_egp", label: "CDs & Cash", color: "#1abc9c"},
+  {k: "fx_egp", label: "FX Cash", color: "#3498db"},
+  {k: "gold_egp", label: "Gold", color: "#f1c40f"},
+  {k: "funds_egp", label: "Mutual Funds", color: "#8c8cff"},
+  {k: "us_stocks_egp", label: "US Stock", color: "#e67e22"},
+  {k: "stocks_egp", label: "EGX Equities", color: "#2ecc71"}
+];
+const RANGES = ["1M", "3M", "6M", "1Y", "YTD", "All"];
+let view = "total", range = __RANGE__, hover = null, pts = [];
+const H = 265, M = {l: 52, r: 10, t: 10, b: 22};
+const $ = id => document.getElementById(id);
+
+function fmtDate(t) {
+  return new Date(t).toLocaleDateString("en-GB", {day: "2-digit", month: "short", year: "numeric", timeZone: "UTC"});
+}
+function money(n) { return n.toLocaleString("en-US", {minimumFractionDigits: 0, maximumFractionDigits: 0}) + " " + CCY; }
+function kfmt(n) {
+  const a = Math.abs(n);
+  return a >= 1e6 ? (n / 1e6).toFixed(2) + "M" : a >= 1e3 ? Math.round(n / 1e3) + "K" : String(Math.round(n));
+}
+function niceTicks(lo, hi, n) {
+  if (hi <= lo) return [lo];
+  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / mag;
+  const step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * mag, out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(v);
+  return out;
+}
+function sliceRange() {
+  if (!D.length) return [];
+  const last = D[D.length - 1], day = 86400000;
+  let cut = 0;
+  if (range === "1M") cut = last.t - 31 * day;
+  else if (range === "3M") cut = last.t - 92 * day;
+  else if (range === "6M") cut = last.t - 183 * day;
+  else if (range === "1Y") cut = last.t - 365 * day;
+  else if (range === "YTD") cut = Date.UTC(new Date(last.t).getUTCFullYear(), 0, 1);
+  let out = D.filter(p => p.t >= cut);
+  if (out.length < 2 && D.length >= 2) out = D.slice(-2);
+  return out;
+}
+function smoothPath(xy) {
+  const n = xy.length;
+  if (n === 0) return "";
+  if (n === 1) return "M" + xy[0][0] + "," + xy[0][1];
+  const dx = [], m = [], t = new Array(n);
+  for (let i = 0; i < n - 1; i++) { dx.push(xy[i + 1][0] - xy[i][0]); m.push((xy[i + 1][1] - xy[i][1]) / (dx[i] || 1)); }
+  t[0] = m[0]; t[n - 1] = m[n - 2];
+  for (let i = 1; i < n - 1; i++) t[i] = m[i - 1] * m[i] <= 0 ? 0 : (m[i - 1] + m[i]) / 2;
+  for (let i = 0; i < n - 1; i++) {
+    if (m[i] === 0) { t[i] = 0; t[i + 1] = 0; continue; }
+    const a = t[i] / m[i], b = t[i + 1] / m[i], s = a * a + b * b;
+    if (s > 9) { const k = 3 / Math.sqrt(s); t[i] = k * a * m[i]; t[i + 1] = k * b * m[i]; }
+  }
+  let d = "M" + xy[0][0] + "," + xy[0][1];
+  for (let i = 0; i < n - 1; i++) {
+    const h = dx[i] / 3;
+    d += "C" + (xy[i][0] + h) + "," + (xy[i][1] + t[i] * h) + " " + (xy[i + 1][0] - h) + "," + (xy[i + 1][1] - t[i + 1] * h) +
+         " " + xy[i + 1][0] + "," + xy[i + 1][1];
+  }
+  return d;
+}
+function setHeader() {
+  if (!pts.length) return;
+  const i = hover === null ? pts.length - 1 : hover, p = pts[i], first = pts[0];
+  const diff = p.total_egp - first.total_egp;
+  const pct = first.total_egp > 0 ? (diff / first.total_egp) * 100 : 0;
+  const sign = diff > 0 ? "+" : diff < 0 ? "\u2212" : "";
+  const cls = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
+  $("lbl").textContent = "Net Worth on " + fmtDate(p.t);
+  $("big").textContent = money(p.total_egp);
+  if (pts.length >= 2 && i > 0) {
+    $("delta").className = "delta " + cls;
+    $("delta").textContent = `${sign}${money(Math.abs(diff))} (${sign}${Math.abs(pct).toFixed(2)}%) vs ${fmtDate(first.t)}`;
+  } else {
+    $("delta").textContent = "";
+  }
+  const usdPct = p.total_egp > 0 ? (p.usd_total_egp / p.total_egp * 100).toFixed(1) : "0.0";
+  $("subRight").textContent = `${pts.length} snapshot(s) · USD share: ${usdPct}%`;
+}
+function render() {
+  pts = sliceRange();
+  const W = $("plot").clientWidth || 700, pw = W - M.l - M.r, ph = H - M.t - M.b;
+  let lo = 0, hi = 1;
+  if (view === "total") {
+    lo = Math.min(...pts.map(p => p.total_egp));
+    hi = Math.max(...pts.map(p => p.total_egp));
+    const pad = (hi - lo) * 0.18 || Math.abs(hi) * 0.08 || 1000;
+    lo = Math.max(0, lo - pad); hi += pad;
+  } else {
+    lo = 0;
+    hi = Math.max(...pts.map(p => p.total_egp)) * 1.08 || 1000;
+  }
+  const t0 = pts[0].t, t1 = pts.length > 1 ? pts[pts.length - 1].t : t0 + 1;
+  const X = t => pts.length === 1 ? M.l + pw / 2 : M.l + ((t - t0) / (t1 - t0)) * pw;
+  const Y = v => M.t + (1 - (v - lo) / (hi - lo || 1)) * ph;
+
+  let g = "";
+  for (const v of niceTicks(lo, hi, 4)) {
+    const y = Y(v);
+    g += `<line x1="${M.l}" x2="${W - M.r}" y1="${y}" y2="${y}" stroke="#262a31"/>` +
+         `<text x="${M.l - 8}" y="${y + 4}" text-anchor="end" fill="#8a8f98" font-size="11">${kfmt(v)}</text>`;
+  }
+  g += `<line x1="${M.l}" x2="${W - M.r}" y1="${H - M.b}" y2="${H - M.b}" stroke="#3a3f48"/>`;
+
+  if (view === "total") {
+    const color = pts[pts.length - 1].total_egp >= pts[0].total_egp ? GREEN : RED;
+    g += `<defs><linearGradient id="nwg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity=".28"/>` +
+         `<stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>`;
+    if (pts.length > 1) {
+      const xy = pts.map(p => [X(p.t), Y(p.total_egp)]), line = smoothPath(xy);
+      g += `<path d="${line} L${xy[xy.length - 1][0]},${H - M.b} L${xy[0][0]},${H - M.b} Z" fill="url(#nwg)"/>` +
+           `<path d="${line}" fill="none" stroke="${color}" stroke-width="2.2" stroke-linejoin="round"/>`;
+    }
+    for (const p of pts) {
+      g += `<circle cx="${X(p.t)}" cy="${Y(p.total_egp)}" r="4" fill="${color}" stroke="#1c1f26" stroke-width="1.5"/>`;
+    }
+  } else {
+    const cum = pts.map(() => 0);
+    for (const s of SLICES) {
+      const prev = [...cum];
+      for (let i = 0; i < pts.length; i++) cum[i] += Math.max(0, pts[i][s.k] || 0);
+      if (pts.length > 1) {
+        const topPts = pts.map((p, i) => `${X(p.t)},${Y(cum[i])}`).join(" L");
+        const botPts = pts.map((p, i) => `${X(p.t)},${Y(prev[i])}`).reverse().join(" L");
+        g += `<path d="M${topPts} L${botPts} Z" fill="${s.color}" fill-opacity=".45" stroke="${s.color}" stroke-width="1.4"/>`;
+      } else {
+        const x = X(pts[0].t);
+        g += `<line x1="${x - 30}" x2="${x + 30}" y1="${Y(cum[0])}" y2="${Y(cum[0])}" stroke="${s.color}" stroke-width="4"/>`;
+      }
+    }
+  }
+
+  if (hover !== null && pts[hover]) {
+    const x = X(pts[hover].t);
+    g += `<line x1="${x}" x2="${x}" y1="${M.t}" y2="${H - M.b}" stroke="#fff" stroke-width="1.5" stroke-dasharray="3 3"/>`;
+  }
+  g += `<rect id="hit" x="${M.l}" y="0" width="${pw}" height="${H}" fill="transparent"/>`;
+  const svg = $("svg"); svg.setAttribute("height", H); svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.innerHTML = g;
+
+  const hit = $("hit");
+  const move = e => {
+    const r = svg.getBoundingClientRect(), cx = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+    let best = 0;
+    for (let i = 1; i < pts.length; i++) if (Math.abs(X(pts[i].t) - cx) < Math.abs(X(pts[best].t) - cx)) best = i;
+    if (best !== hover) { hover = best; render(); showTip(X(pts[best].t), Y(pts[best].total_egp)); }
+  };
+  hit.onmousemove = move; hit.ontouchmove = move;
+  hit.onmouseleave = hit.ontouchend = () => { hover = null; $("tip").style.display = "none"; render(); };
+  setHeader();
+  if (hover !== null && pts[hover]) showTip(X(pts[hover].t), Y(pts[hover].total_egp));
+}
+function showTip(x, y) {
+  const p = pts[hover], tip = $("tip");
+  const row = (l, v, c) => `<div class="row"><span style="color:${c || '#9aa0a6'}">${l}</span><b>${money(v)}</b></div>`;
+  let html = `<div class="t">${fmtDate(p.t)}</div>` + row("Total Net Worth", p.total_egp, "#fff");
+  for (const s of [...SLICES].reverse()) {
+    if ((p[s.k] || 0) > 0) html += row(s.label, p[s.k], s.color);
+  }
+  tip.innerHTML = html;
+  tip.style.display = "block";
+  const w = tip.offsetWidth, plotW = $("plot").clientWidth;
+  tip.style.left = Math.max(8, (x + 14 + w > plotW ? x - 14 - w : x + 14)) + "px";
+  tip.style.top = Math.max(4, Math.min(y, H - tip.offsetHeight - 4)) + "px";
+}
+$("vTotal").onclick = () => { view = "total"; hover = null; $("vTotal").classList.add("on"); $("vStack").classList.remove("on"); render(); };
+$("vStack").onclick = () => { view = "stack"; hover = null; $("vStack").classList.add("on"); $("vTotal").classList.remove("on"); render(); };
+RANGES.forEach(r => {
+  const b = document.createElement("button"); b.textContent = r; b.dataset.r = r;
+  b.onclick = () => { range = r; hover = null; document.querySelectorAll("#pills button")
+    .forEach(x => x.classList.toggle("on", x.dataset.r === r)); render(); };
+  if (r === range) b.classList.add("on");
+  $("pills").appendChild(b);
+});
+window.addEventListener("resize", render);
+render();
+</script>
+"""
