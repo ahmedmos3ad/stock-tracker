@@ -16,11 +16,21 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import importlib
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from tracker import BUY, SELL, Store, Transaction, compute_positions, companies
+import tracker.db as _db_mod
+import tracker.networth as _nw_mod
+
+_saved_defaults = _db_mod.Store.__init__.__defaults__
+importlib.reload(_nw_mod)
+importlib.reload(_db_mod)
+_db_mod.Store.__init__.__defaults__ = _saved_defaults
+
+from tracker import BUY, SELL, Transaction, compute_positions, companies
+from tracker.db import Store
 from tracker import performance as perf
 from tracker.actions import apply_corporate_actions, resolve_actions
 from tracker.assets import fund_list, stale_navs, stock_symbols
@@ -33,6 +43,26 @@ from tracker.calculator import (
 )
 from tracker.chart import HEIGHT as CARD_HEIGHT, card_html
 from tracker.history import EGX30_SYMBOL, fetch_history
+from tracker.networth import (
+    CAT_CASH,
+    CAT_CD,
+    CAT_FUND,
+    CAT_FX,
+    CAT_GOLD,
+    CAT_US_STOCK,
+    CD_CURRENCIES,
+    COMMON_CURRENCIES,
+    GOLD_PRESETS,
+    NetWorthItem,
+    compute_net_worth,
+    effective_fx_rate,
+    effective_gold_prices,
+    item_annual_income_egp,
+    item_annual_income_native,
+    item_currency,
+    item_native_value,
+    item_value_egp,
+)
 from tracker.portfolio import Dividend
 from tracker.prices import fetch_latest_eodhd_close
 
@@ -47,11 +77,11 @@ def cairo_today() -> date:
 def cairo_now() -> datetime:
     return datetime.now(ZoneInfo("Africa/Cairo"))
 
-st.set_page_config(page_title="Stock Tracker", page_icon=":chart_with_upwards_trend:", layout="wide")
+st.set_page_config(page_title="Portfolio & Stock Tracker", page_icon=":chart_with_upwards_trend:", layout="wide")
 
 
 @st.cache_resource
-def get_store() -> Store:
+def get_store(_schema_version: int = 4) -> Store:
     s = Store()
     s.data_version = 0
 
@@ -68,7 +98,7 @@ def get_store() -> Store:
         "add_transaction", "update_transaction", "delete_transaction",
         "add_dividend", "update_dividend", "delete_dividend", "set_price",
         "add_corporate_action", "delete_corporate_action", "upsert_price_history", "set_fund",
-        "set_setting",
+        "set_setting", "add_net_worth_item", "update_net_worth_item", "delete_net_worth_item",
     ):
         setattr(s, name, _invalidating(getattr(s, name)))
     return s
@@ -93,6 +123,7 @@ def load_data(version: int, db_mtime_ns: int):
         store.price_history(),
         store.fund_symbols(),
         store.settings(),
+        store.list_net_worth_items(),
     )
 
 if "price_sync_message" not in st.session_state:
@@ -360,7 +391,7 @@ if "toast" in st.session_state:
 
 (
     all_txn_rows, all_dividend_rows, saved_prices, saved_price_entries,
-    all_action_rows, price_history, fund_rows, settings_rows,
+    all_action_rows, price_history, fund_rows, settings_rows, all_nw_rows,
 ) = load_data(store.data_version, os.stat(store.db_path).st_mtime_ns)
 fund_symbols = set(fund_rows)  # symbols flagged as funds: priced by hand, never synced from EODHD
 app_settings = dict(settings_rows)  # persisted preferences (deposit rate, size limit, ...)
@@ -400,7 +431,7 @@ all_dividends_obj = [Dividend(symbol=r["symbol"], amount=r["amount"], date=r["da
 # --- Header ------------------------------------------------------------------
 title_col, action_col = st.columns([5, 1], vertical_alignment="center")
 with title_col:
-    st.title("📈 Stock Tracker")
+    st.title("📈 Portfolio & Stock Tracker")
 with action_col:
     if st.button("\\+ Add transaction", type="primary", use_container_width=True):
         open_transaction_dialog()
@@ -419,10 +450,10 @@ adj_txns = apply_corporate_actions(txns, all_action_rows)
 positions = compute_positions(adj_txns, dividends=all_dividends_obj, prices=saved_prices)
 symbols = sorted({t.symbol for t in txns})
 
-(tab_portfolio, tab_allocation, tab_perf, tab_dca, tab_prices, tab_txns, tab_dividends) = st.tabs(
+(tab_portfolio, tab_allocation, tab_perf, tab_dca, tab_prices, tab_txns, tab_dividends, tab_networth) = st.tabs(
     [
         "📊 Portfolio", "🥧 Allocation", "📈 Performance", "🧮 Buy / Sell Planner",
-        "💲 Prices", "🧾 Transactions", "💰 Dividends",
+        "💲 Prices", "🧾 Transactions", "💰 Dividends", "🏦 Net Worth",
     ]
 )
 
@@ -1571,3 +1602,861 @@ def perf_tab(positions, adj_txns, dividends, history, price_entries) -> None:
 
 with tab_perf:
     perf_tab(positions, adj_txns, all_dividends_obj, price_history, saved_price_entries)
+
+
+# --- Net Worth tab --------------------------------------------------------------
+_NW_CAT_LABELS = {
+    CAT_US_STOCK: "🌎 US / Employer Stock (e.g. PCOR / ESPP)",
+    CAT_FUND: "📊 Mutual Fund (Money Market / Fixed Income / Savings)",
+    CAT_GOLD: "🪙 Gold (Bars / Pounds)",
+    CAT_FX: "💵 Foreign Currency (Cash)",
+    CAT_CD: "📜 Certificate of Deposit (CD — EGP or Foreign Currency)",
+    CAT_CASH: "🏦 Cash / Savings Account",
+}
+_NW_CAT_SHORT = {
+    CAT_US_STOCK: "🌎 US Stock",
+    CAT_FUND: "📊 Fund",
+    CAT_GOLD: "🪙 Gold",
+    CAT_FX: "💵 FX",
+    CAT_CD: "📜 CD",
+    CAT_CASH: "🏦 Cash",
+}
+
+
+@st.dialog("🏦 Net Worth Item", width="large")
+def net_worth_dialog(
+    item: dict | None, nonce: int, price_24k: float, price_21k: float, usd_egp_rate: float
+) -> None:
+    """Add (item=None) or edit a non-stock asset (US Stock, Mutual Fund, Gold, FX, CD, or Cash)."""
+    editing = item is not None
+    p = f"nw{nonce}_"
+    cats = [CAT_US_STOCK, CAT_FUND, CAT_GOLD, CAT_FX, CAT_CD, CAT_CASH]
+    default_cat = item["category"] if editing and item["category"] in cats else CAT_US_STOCK
+    category = st.selectbox(
+        "Asset category",
+        cats,
+        index=cats.index(default_cat),
+        format_func=lambda c: _NW_CAT_LABELS[c],
+        key=f"{p}cat",
+    )
+
+    p24, p21 = effective_gold_prices(price_24k, price_21k)
+    karat = 24
+    grams = 0.0
+    unit_value = 0.0
+    currency = "EGP"
+    fx_rate = 1.0
+
+    if category == CAT_US_STOCK:
+        currency = "USD"
+        name = st.text_input(
+            "Ticker / Stock label",
+            value=item["name"] if editing else "PCOR",
+            placeholder="e.g. PCOR or PCOR (ESPP)",
+            key=f"{p}us_name",
+        ).strip()
+        c1, c2, c3 = st.columns([1.2, 1.2, 1.2])
+        quantity = float(
+            c1.number_input(
+                "Shares held",
+                min_value=0.0,
+                step=1.0,
+                format="%.4f",
+                value=float(item["quantity"]) if editing else 0.0,
+                key=f"{p}us_qty",
+            )
+        )
+        unit_value = float(
+            c2.number_input(
+                "Current share price ($ USD)",
+                min_value=0.0,
+                step=0.5,
+                format="%.2f",
+                value=float(item["unit_value"]) if editing else 0.0,
+                key=f"{p}us_px",
+            )
+        )
+        default_fx = (
+            float(usd_egp_rate)
+            if usd_egp_rate > 0
+            else (float(item.get("fx_rate") or 50.0) if editing and float(item.get("fx_rate") or 0) > 1.0 else 50.0)
+        )
+        fx_rate = float(
+            c3.number_input(
+                f"USD Rate ({CCY} per $1)",
+                min_value=0.0,
+                step=0.1,
+                format="%.4f",
+                value=default_fx,
+                key=f"{p}us_fx_rate",
+            )
+        )
+        usd_val = quantity * unit_value
+        st.caption(f"Value: **${usd_val:,.2f} USD** → **{usd_val * fx_rate:,.2f} {CCY}**")
+
+    elif category == CAT_FUND:
+        name_col, ccy_col = st.columns([2.2, 1])
+        name = name_col.text_input(
+            "Mutual fund name",
+            value=item["name"] if editing else "",
+            placeholder="e.g. Beltone B-Secure (BMM) / Fawry Yawmy",
+            key=f"{p}fund_name",
+        ).strip()
+        fund_curr_opts = list(CD_CURRENCIES) + [OTHER]
+        existing_ccy = (item.get("currency") or "EGP").upper() if editing else "EGP"
+        default_fund_ccy = existing_ccy if existing_ccy in CD_CURRENCIES else OTHER
+        picked_ccy = ccy_col.selectbox(
+            "Currency",
+            fund_curr_opts,
+            index=fund_curr_opts.index(default_fund_ccy),
+            format_func=lambda s: "Other…" if s == OTHER else s,
+            key=f"{p}fund_ccy",
+        )
+        if picked_ccy == OTHER:
+            currency = st.text_input(
+                "Currency code",
+                value=existing_ccy if editing and existing_ccy not in CD_CURRENCIES else "",
+                placeholder="e.g. CAD",
+                key=f"{p}fund_ccy_custom",
+            ).strip().upper() or "EGP"
+        else:
+            currency = picked_ccy
+
+        modes = ["Total Value / Balance", "Units × NAV Price"]
+        default_mode = 1 if (editing and float(item["unit_value"]) > 0) else 0
+        entry_mode = st.radio(
+            "How to enter balance",
+            modes,
+            index=default_mode,
+            horizontal=True,
+            key=f"{p}fund_mode",
+        )
+
+        if currency != "EGP":
+            default_fx = (
+                float(usd_egp_rate)
+                if currency == "USD" and usd_egp_rate > 0
+                else (float(item.get("fx_rate") or 50.0) if editing and float(item.get("fx_rate") or 0) > 1.0 else 50.0)
+            )
+        else:
+            default_fx = 1.0
+
+        if entry_mode == "Total Value / Balance":
+            if currency == "EGP":
+                c1, c_rate = st.columns(2)
+                fx_rate = 1.0
+            else:
+                c1, c_rate, c_fx = st.columns([1.4, 1.1, 1.3])
+                fx_rate = float(
+                    c_fx.number_input(
+                        f"Rate ({CCY} per 1 {currency})",
+                        min_value=0.0,
+                        step=0.1,
+                        format="%.4f",
+                        value=default_fx,
+                        key=f"{p}fund_fx_rate",
+                    )
+                )
+            quantity = float(
+                c1.number_input(
+                    f"Current total value ({currency})",
+                    min_value=0.0,
+                    step=1000.0 if currency == "EGP" else 100.0,
+                    format="%.2f",
+                    value=float(item["quantity"] * (item["unit_value"] or 1.0)) if editing else 0.0,
+                    key=f"{p}fund_total",
+                )
+            )
+            grams = float(
+                c_rate.number_input(
+                    "Avg expected rate (% / yr, optional)",
+                    min_value=0.0,
+                    max_value=200.0,
+                    step=0.25,
+                    format="%.2f",
+                    value=float(item.get("grams") or 0.0) if editing else 20.0,
+                    key=f"{p}fund_yield",
+                )
+            )
+            unit_value = 0.0
+            native_val = quantity
+        else:
+            if currency == "EGP":
+                c1, c2, c_rate = st.columns([1.2, 1.2, 1.2])
+                fx_rate = 1.0
+            else:
+                c1, c2, c_rate, c3 = st.columns([1.1, 1.1, 1.1, 1.1])
+                fx_rate = float(
+                    c3.number_input(
+                        f"Rate ({CCY} per 1 {currency})",
+                        min_value=0.0,
+                        step=0.1,
+                        format="%.4f",
+                        value=default_fx,
+                        key=f"{p}fund_fx_rate",
+                    )
+                )
+            quantity = float(
+                c1.number_input(
+                    "Units held",
+                    min_value=0.0,
+                    step=10.0,
+                    format="%.4f",
+                    value=float(item["quantity"]) if editing else 0.0,
+                    key=f"{p}fund_units",
+                )
+            )
+            unit_value = float(
+                c2.number_input(
+                    f"Current NAV / unit price ({currency})",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.4f",
+                    value=float(item["unit_value"]) if editing and float(item["unit_value"]) > 0 else 1.0,
+                    key=f"{p}fund_nav",
+                )
+            )
+            grams = float(
+                c_rate.number_input(
+                    "Avg expected rate (% / yr, optional)",
+                    min_value=0.0,
+                    max_value=200.0,
+                    step=0.25,
+                    format="%.2f",
+                    value=float(item.get("grams") or 0.0) if editing else 20.0,
+                    key=f"{p}fund_yield",
+                )
+            )
+            native_val = quantity * unit_value
+
+        val_egp = native_val * fx_rate
+        cap_parts = [
+            f"Value: **{native_val:,.2f} {currency}**"
+            + (f" → **{val_egp:,.2f} {CCY}**" if currency != "EGP" else "")
+        ]
+        if native_val > 0 and grams > 0:
+            yr_native = native_val * (grams / 100.0)
+            yr_egp = yr_native * fx_rate
+            if currency != "EGP":
+                cap_parts.append(
+                    f"Expected return: **~{yr_native:,.2f} {currency}/yr** "
+                    f"(**~{yr_egp:,.0f} {CCY}/yr** · **~{yr_egp / 12.0:,.0f} {CCY}/mo**)"
+                )
+            else:
+                cap_parts.append(
+                    f"Expected return: **~{yr_egp:,.0f} {CCY}/yr** (**~{yr_egp / 12.0:,.0f} {CCY}/mo**)"
+                )
+        st.caption(" · ".join(cap_parts))
+
+    elif category == CAT_GOLD:
+        preset_names = list(GOLD_PRESETS.keys()) + [OTHER]
+        default_preset = item["name"] if editing and item["name"] in GOLD_PRESETS else (OTHER if editing else preset_names[0])
+        chosen_preset = st.selectbox(
+            "Gold item",
+            preset_names,
+            index=preset_names.index(default_preset),
+            format_func=lambda s: "Custom gold item…" if s == OTHER else s,
+            key=f"{p}gold_preset",
+        )
+        if chosen_preset == OTHER:
+            c1, c2, c3 = st.columns([2, 1, 1])
+            name = c1.text_input(
+                "Item name",
+                value=item["name"] if editing else "",
+                placeholder="e.g. 50g BTC Bar",
+                key=f"{p}gold_name",
+            ).strip()
+            karat_opts = [24, 21]
+            default_k = int(item["karat"]) if editing and int(item["karat"]) in karat_opts else 24
+            karat = c2.selectbox(
+                "Karat",
+                karat_opts,
+                index=karat_opts.index(default_k),
+                format_func=lambda k: f"{k}K",
+                key=f"{p}gold_karat",
+            )
+            grams = float(
+                c3.number_input(
+                    "Weight per piece (g)",
+                    min_value=0.01,
+                    step=0.5,
+                    format="%.2f",
+                    value=float(item["grams"]) if editing and float(item["grams"]) > 0 else 8.0,
+                    key=f"{p}gold_grams",
+                )
+            )
+        else:
+            name = chosen_preset
+            karat, grams = GOLD_PRESETS[chosen_preset]
+
+        c_qty, c_cb = st.columns(2)
+        quantity = float(
+            c_qty.number_input(
+                "Quantity (pieces)",
+                min_value=0.0,
+                step=1.0,
+                format="%.2f",
+                value=float(item["quantity"]) if editing else 1.0,
+                key=f"{p}gold_qty",
+            )
+        )
+        unit_value = float(
+            c_cb.number_input(
+                f"Cashback / premium on resale ({CCY} / gram, optional)",
+                min_value=0.0,
+                step=5.0,
+                format="%.2f",
+                value=float(item["unit_value"]) if editing else 0.0,
+                help="Extra EGP/gram refunded on resale above the raw gold price (leave 0 for pure bullion value).",
+                key=f"{p}gold_cb",
+            )
+        )
+        active_px = p21 if karat == 21 else p24
+        est_val = quantity * grams * (active_px + unit_value)
+        st.caption(
+            f"Weight: **{quantity * grams:,.2f}g ({karat}K)** · "
+            f"Active {karat}K price: **{active_px:,.2f} {CCY}/g** → "
+            f"Value: **{est_val:,.2f} {CCY}**"
+        )
+
+    elif category == CAT_FX:
+        curr_opts = list(COMMON_CURRENCIES) + [OTHER]
+        existing_ccy = (item.get("currency") if editing else None) or (item["name"] if editing else "USD")
+        default_curr = existing_ccy if existing_ccy in COMMON_CURRENCIES else (OTHER if editing else "USD")
+        c1, c2, c3 = st.columns([1.2, 1.4, 1.4])
+        picked_curr = c1.selectbox(
+            "Currency",
+            curr_opts,
+            index=curr_opts.index(default_curr),
+            format_func=lambda s: "Other…" if s == OTHER else s,
+            key=f"{p}fx_pick",
+        )
+        if picked_curr == OTHER:
+            currency = st.text_input(
+                "Currency code",
+                value=existing_ccy if editing else "",
+                placeholder="e.g. CAD",
+                key=f"{p}fx_custom",
+            ).strip().upper()
+        else:
+            currency = picked_curr
+        name = currency
+        quantity = float(
+            c2.number_input(
+                f"Amount ({currency or 'FX'})",
+                min_value=0.0,
+                step=100.0,
+                format="%.2f",
+                value=float(item["quantity"]) if editing else 0.0,
+                key=f"{p}fx_qty",
+            )
+        )
+        default_rate = (
+            float(usd_egp_rate)
+            if currency == "USD" and usd_egp_rate > 0
+            else (
+                float(item.get("fx_rate") or item["unit_value"])
+                if editing and float(item.get("fx_rate") or item["unit_value"]) > 1.0
+                else 50.0
+            )
+        )
+        fx_rate = float(
+            c3.number_input(
+                f"Exchange rate ({CCY} per 1 {currency or 'unit'})",
+                min_value=0.0,
+                step=0.1,
+                format="%.4f",
+                value=default_rate,
+                key=f"{p}fx_rate",
+            )
+        )
+        unit_value = fx_rate
+        st.caption(f"Value in {CCY}: **{quantity * fx_rate:,.2f} {CCY}**")
+
+    else:
+        is_cd = category == CAT_CD
+        name_col, ccy_col = st.columns([2.2, 1])
+        name = name_col.text_input(
+            "Certificate name / Bank" if is_cd else "Account / Cash label",
+            value=item["name"] if editing else "",
+            placeholder="e.g. NBE USD CD / Banque Misr 27% CD" if is_cd else "e.g. CIB Savings / Thndr Cash",
+            key=f"{p}cd_name",
+        ).strip()
+        cd_curr_opts = list(CD_CURRENCIES) + [OTHER]
+        existing_ccy = (item.get("currency") or "EGP").upper() if editing else "EGP"
+        default_cd_ccy = existing_ccy if existing_ccy in CD_CURRENCIES else OTHER
+        picked_ccy = ccy_col.selectbox(
+            "Currency",
+            cd_curr_opts,
+            index=cd_curr_opts.index(default_cd_ccy),
+            format_func=lambda s: "Other…" if s == OTHER else s,
+            key=f"{p}cd_ccy",
+        )
+        if picked_ccy == OTHER:
+            currency = st.text_input(
+                "Currency code",
+                value=existing_ccy if editing and existing_ccy not in CD_CURRENCIES else "",
+                placeholder="e.g. CAD",
+                key=f"{p}cd_ccy_custom",
+            ).strip().upper() or "EGP"
+        else:
+            currency = picked_ccy
+
+        if currency == "EGP":
+            c1, c2 = st.columns(2)
+            fx_rate = 1.0
+        else:
+            c1, c2, c3 = st.columns([1.4, 1.1, 1.3])
+            default_fx = (
+                float(usd_egp_rate)
+                if currency == "USD" and usd_egp_rate > 0
+                else (float(item.get("fx_rate") or 50.0) if editing and float(item.get("fx_rate") or 0) > 1.0 else 50.0)
+            )
+            fx_rate = float(
+                c3.number_input(
+                    f"Rate ({CCY} per 1 {currency})",
+                    min_value=0.0,
+                    step=0.1,
+                    format="%.4f",
+                    value=default_fx,
+                    key=f"{p}cd_fx_rate",
+                )
+            )
+
+        quantity = float(
+            c1.number_input(
+                f"{'Principal amount' if is_cd else 'Balance'} ({currency})",
+                min_value=0.0,
+                step=1000.0 if currency == "EGP" else 100.0,
+                format="%.2f",
+                value=float(item["quantity"]) if editing else 0.0,
+                key=f"{p}cd_qty",
+            )
+        )
+        default_yield = 5.5 if (is_cd and currency != "EGP") else (27.0 if is_cd else 0.0)
+        unit_value = float(
+            c2.number_input(
+                "Interest rate (% / yr)",
+                min_value=0.0,
+                max_value=200.0,
+                step=0.25,
+                format="%.2f",
+                value=float(item["unit_value"]) if editing else default_yield,
+                key=f"{p}cd_rate",
+            )
+        )
+        val_egp = quantity * fx_rate
+        if quantity > 0:
+            parts = [f"Value in {CCY}: **{val_egp:,.2f} {CCY}**"]
+            if unit_value > 0:
+                yr_native = quantity * (unit_value / 100.0)
+                yr_egp = yr_native * fx_rate
+                if currency != "EGP":
+                    parts.append(
+                        f"Payout: **{yr_native:,.2f} {currency}/yr** "
+                        f"(**{yr_egp:,.0f} {CCY}/yr** · **{yr_egp / 12.0:,.0f} {CCY}/mo**)"
+                    )
+                else:
+                    parts.append(f"Payout: **{yr_egp:,.0f} {CCY}/yr** (**{yr_egp / 12.0:,.0f} {CCY}/mo**)")
+            st.caption(" · ".join(parts))
+
+    notes = st.text_input(
+        "Notes (optional)",
+        value=item["notes"] if editing else "",
+        placeholder="e.g. Matures Jan 2027, held at CIB, BTC bar…",
+        key=f"{p}notes",
+    ).strip()
+
+    st.write("")
+    if st.button(
+        "Save changes" if editing else "Add to Net Worth",
+        type="primary",
+        use_container_width=True,
+        key=f"{p}save",
+    ):
+        if not name:
+            st.error("Please provide a name or select an item.")
+        elif quantity <= 0:
+            st.error("Quantity / amount must be greater than zero.")
+        else:
+            if currency == "USD" and fx_rate > 0 and abs(fx_rate - usd_egp_rate) > 1e-6:
+                store.set_setting("usd_egp_rate", fx_rate)
+            if editing:
+                store.update_net_worth_item(
+                    int(item["id"]), category, name, quantity, unit_value, karat, grams, notes, currency, fx_rate
+                )
+                st.session_state["toast"] = f"Updated {name}."
+            else:
+                store.add_net_worth_item(
+                    category, name, quantity, unit_value, karat, grams, notes, currency, fx_rate
+                )
+                st.session_state["toast"] = f"Added {name} to Net Worth."
+            st.rerun()
+
+
+def _nw_donut_html(nw: dict) -> str:
+    """SVG donut chart + legend inside a dark card matching PORTFOLIO_CSS."""
+    import math
+
+    r = 70.0
+    circumference = 2.0 * math.pi * r
+    offset = 0.0
+    circles = []
+    for s in nw["slices"]:
+        if s["pct"] <= 0:
+            continue
+        dash = (s["pct"] / 100.0) * circumference
+        circles.append(
+            f"<circle r='{r}' cx='95' cy='95' fill='transparent' stroke='{s['color']}' "
+            f"stroke-width='24' stroke-dasharray='{dash:.3f} {circumference:.3f}' "
+            f"stroke-dashoffset='{-offset:.3f}' transform='rotate(-90 95 95)'/>"
+        )
+        offset += dash
+    if not circles:
+        circles.append(
+            f"<circle r='{r}' cx='95' cy='95' fill='transparent' stroke='#262a33' stroke-width='24'/>"
+        )
+
+    legend = []
+    for s in nw["slices"]:
+        legend.append(
+            "<div style='display:flex;justify-content:space-between;align-items:center;"
+            "padding:5px 0;border-bottom:1px solid #262a33;font-size:.88rem'>"
+            f"<span><span class='dot' style='background:{s['color']};display:inline-block;"
+            "width:9px;height:9px;border-radius:50%;margin-right:8px'></span>"
+            f"{_esc(s['label'])}</span>"
+            f"<span style='font-weight:600'>{s['pct']:.1f}% · {egx_money(s['value'])}</span>"
+            "</div>"
+        )
+
+    return (
+        "<div class='pf-card' style='display:flex;flex-direction:column;align-items:center;padding:18px'>"
+        "<svg width='190' height='190' viewBox='0 0 190 190'>"
+        + "".join(circles)
+        + "<text x='95' y='90' text-anchor='middle' fill='#9aa0a6' font-size='11' font-weight='600'>NET WORTH</text>"
+        + f"<text x='95' y='110' text-anchor='middle' fill='#fff' font-size='14' font-weight='700'>{_esc(egx_money(nw['total']))}</text>"
+        + "</svg>"
+        + "<div style='width:100%;margin-top:12px'>"
+        + "".join(legend)
+        + "</div></div>"
+    )
+
+
+def _nw_bars_html(nw: dict, meta_by_key: dict[str, str]) -> str:
+    """Horizontal allocation bars for each Net Worth slice + Currency/USD Exposure bar."""
+    max_pct = max((s["pct"] for s in nw["slices"]), default=1.0) or 1.0
+    rows = []
+    for s in nw["slices"]:
+        fill = min(s["pct"] / max_pct * 100.0, 100.0) if max_pct > 0 else 0.0
+        sub = meta_by_key.get(s["key"], "")
+        rows.append(
+            f"<div class='al-row' style='grid-template-columns:175px 1fr 64px 200px;border-left-color:{s['color']}'>"
+            f"<div class='al-id'><span style='display:inline-block;width:10px;height:10px;border-radius:50%;background:{s['color']}'></span>"
+            f"{_esc(s['label'])}</div>"
+            f"<div class='al-track'><div class='al-fill' style='width:{fill:.1f}%;background:{s['color']}'></div></div>"
+            f"<div class='al-w'>{s['pct']:.1f}%</div>"
+            f"<div class='al-meta'><strong style='color:#e6e6e6'>{egx_money(s['value'])}</strong>"
+            + (f"<br>{_esc(sub)}" if sub else "")
+            + "</div></div>"
+        )
+
+    # Currency & Hedge Exposure summary card (shows exact % of Net Worth in EGP vs USD vs Gold)
+    usd_parts = []
+    if nw.get("usd_stock_usd", 0) > 0:
+        usd_parts.append(f"${nw['usd_stock_usd']:,.0f} US stock")
+    if nw["usd_cash_usd"] > 0:
+        usd_parts.append(f"${nw['usd_cash_usd']:,.0f} cash")
+    if nw["usd_cd_usd"] > 0:
+        usd_parts.append(f"${nw['usd_cd_usd']:,.0f} in CDs")
+    if nw.get("usd_fund_usd", 0) > 0:
+        usd_parts.append(f"${nw['usd_fund_usd']:,.0f} in funds")
+    usd_detail = (
+        f"${nw['usd_total_usd']:,.2f} total (" + " · ".join(usd_parts) + ")"
+        if nw["usd_total_usd"] > 0
+        else "No USD held"
+    )
+    exposure_items = [
+        ("🇪🇬 EGP Assets", nw["egp_pct"], nw["egp_exposure_egp"], "#2ecc71", "Equities, EGP Funds & EGP CDs/Cash"),
+        ("🇺🇸 USD Exposure", nw["usd_pct"], nw["usd_total_egp"], "#3498db", usd_detail),
+        ("🪙 Gold Exposure", nw["gold_pct"], nw["by_key"]["gold"], "#f1c40f", f"{nw['gold_total_grams']:,.1f}g total"),
+    ]
+    if nw["other_fx_egp"] > 0:
+        exposure_items.append(
+            ("🌍 Other FX", nw["other_fx_pct"], nw["other_fx_egp"], "#9b59b6", "Non-USD foreign currency")
+        )
+
+    seg_bars = []
+    pills = []
+    for label, pct_val, egp_val, color, detail in exposure_items:
+        if pct_val > 0:
+            seg_bars.append(f"<div style='width:{pct_val:.2f}%;background:{color};height:10px'></div>")
+        pills.append(
+            "<div style='flex:1;min-width:140px;background:#161920;border:1px solid #262a33;"
+            f"border-left:3px solid {color};border-radius:8px;padding:8px 10px'>"
+            f"<div style='font-size:.78rem;color:#9aa0a6'>{_esc(label)}</div>"
+            f"<div style='font-weight:700;font-size:1rem;color:#fff'>{pct_val:.1f}% · {_esc(egx_money(egp_val))}</div>"
+            f"<div style='font-size:.73rem;color:#8a8f98'>{_esc(detail)}</div>"
+            "</div>"
+        )
+
+    exposure_card = (
+        "<div class='pf-card' style='margin-top:10px;padding:12px 14px'>"
+        "<div style='font-size:.78rem;color:#9aa0a6;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px'>"
+        "Currency &amp; Hedge Exposure (% of Net Worth)</div>"
+        "<div style='display:flex;width:100%;height:10px;background:#262a33;border-radius:6px;overflow:hidden;margin-bottom:10px'>"
+        + "".join(seg_bars)
+        + "</div>"
+        + "<div style='display:flex;gap:10px;flex-wrap:wrap'>"
+        + "".join(pills)
+        + "</div></div>"
+    )
+    return "".join(rows) + exposure_card
+
+
+@st.fragment
+def net_worth_tab(positions, funds: set, nw_rows: list[dict]) -> None:
+    st.markdown(PORTFOLIO_CSS, unsafe_allow_html=True)
+    items = [
+        NetWorthItem(
+            id=int(r["id"]),
+            category=r["category"],
+            name=r["name"],
+            quantity=float(r["quantity"]),
+            unit_value=float(r["unit_value"]),
+            karat=int(r["karat"]),
+            grams=float(r["grams"]),
+            currency=str(r.get("currency") or "EGP"),
+            fx_rate=float(r.get("fx_rate") if r.get("fx_rate") is not None else 1.0),
+            notes=r["notes"],
+        )
+        for r in nw_rows
+    ]
+
+    st.caption(
+        "Complete picture of your net worth in **EGP**, plus your exact **USD % exposure** across both cash and certificates. "
+        "**Stocks (EGX)** and **Mutual Funds** sync automatically from your portfolio."
+    )
+
+    # --- Gold gram prices + USD/EGP rate + Add button ---------------------------------
+    g1, g2, g3, g4 = st.columns([1.1, 1.1, 1.1, 1.1], vertical_alignment="bottom")
+    raw_24k = g1.number_input(
+        f"🪙 24K Gold ({CCY} / g)",
+        min_value=0.0,
+        step=10.0,
+        format="%.2f",
+        value=setting_float("gold_24k_price", 0.0),
+        key="nw_gold_24k",
+        on_change=_save_setting,
+        args=("nw_gold_24k", "gold_24k_price"),
+        help="Used to value 24K gold bars. If 21K is left at 0, 21K is auto-calculated as 24K × 21/24.",
+    )
+    raw_21k = g2.number_input(
+        f"🪙 21K Gold ({CCY} / g)",
+        min_value=0.0,
+        step=10.0,
+        format="%.2f",
+        value=setting_float("gold_21k_price", 0.0),
+        key="nw_gold_21k",
+        on_change=_save_setting,
+        args=("nw_gold_21k", "gold_21k_price"),
+        help="Used to value 21K Gold Pounds. Leave at 0 to auto-derive from 24K (or enter only 21K to derive 24K).",
+    )
+    usd_rate = g3.number_input(
+        f"💵 USD Rate ({CCY} / $1)",
+        min_value=0.0,
+        step=0.25,
+        format="%.2f",
+        value=setting_float("usd_egp_rate", 0.0),
+        key="nw_usd_rate",
+        on_change=_save_setting,
+        args=("nw_usd_rate", "usd_egp_rate"),
+        help="Exchange rate applied to all USD cash balances and USD Certificates of Deposit. Saved automatically.",
+    )
+    p24, p21 = effective_gold_prices(raw_24k, raw_21k)
+    if g4.button("➕ Add Net Worth Item", type="primary", use_container_width=True, key="nw_add_btn"):
+        net_worth_dialog(None, _new_dialog_nonce(), p24, p21, usd_rate)
+
+    if (raw_24k > 0 and raw_21k == 0) or (raw_21k > 0 and raw_24k == 0):
+        st.caption(
+            f"Active gold prices: **24K = {p24:,.2f} {CCY}/g** · **21K = {p21:,.2f} {CCY}/g** *(auto-derived by karat ratio)*"
+        )
+
+    nw = compute_net_worth(positions, funds, items, p24, p21, usd_rate)
+    by_k = nw["by_key"]
+    tot = nw["total"] or 1.0
+    equities_val = by_k["stocks"]
+    cd_val = by_k["cd_cash"]
+
+    # --- Top Hero Metrics -------------------------------------------------------------
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Net Worth", money(nw["total"]), f"{len(items)} manual item(s)", delta_color="off")
+    m2.metric(
+        "Equities (Stocks & Funds)",
+        money(equities_val),
+        f"{equities_val / tot * 100:.1f}% of net worth" if nw["total"] > 0 else None,
+        delta_color="off",
+        help="Open EGX stocks and stock funds (such as NBE05) synced from your Portfolio tab.",
+    )
+    usd_delta = (
+        f"{nw['usd_pct']:.1f}% of net worth · ${nw['usd_total_usd']:,.0f} USD"
+        if nw["usd_total_usd"] > 0
+        else ("0.0% of net worth" if nw["total"] > 0 else None)
+    )
+    m3.metric(
+        "Total USD Exposure",
+        money(nw["usd_total_egp"]),
+        usd_delta,
+        delta_color="off",
+        help="Includes liquid USD cash, USD Certificates of Deposit, and USD Mutual Funds, converted to EGP.",
+    )
+    cd_delta = (
+        f"+{nw['annual_cd_income'] / 12.0:,.0f} {CCY}/mo yield"
+        if nw["annual_cd_income"] > 0
+        else (f"{cd_val / tot * 100:.1f}% of net worth" if nw["total"] > 0 else None)
+    )
+    m4.metric("CDs & Cash (Total)", money(cd_val), cd_delta, delta_color="off")
+
+    # --- Donut Chart + Allocation & Currency Breakdown --------------------------------
+    open_stocks = sum(1 for p in positions if p.quantity > 0 and p.symbol not in funds)
+    open_stock_funds = sum(1 for p in positions if p.quantity > 0 and p.symbol in funds)
+    us_stock_items = [it for it in items if it.category == CAT_US_STOCK]
+    us_shares_total = sum(it.quantity for it in us_stock_items)
+    nw_fund_count = sum(1 for it in items if it.category == CAT_FUND)
+    fx_count = sum(1 for it in items if it.category == CAT_FX)
+    cd_parts = []
+    if nw["usd_cd_usd"] > 0:
+        cd_parts.append(f"incl. ${nw['usd_cd_usd']:,.0f} USD in CDs")
+    if nw["annual_cd_income"] > 0:
+        cd_parts.append(f"yields {nw['annual_cd_income'] / 12.0:,.0f} {CCY}/mo")
+    eq_parts = [f"{open_stocks} stock(s)"]
+    if open_stock_funds > 0:
+        eq_parts.append(f"{open_stock_funds} stock fund(s)")
+    fund_parts = [f"{nw_fund_count} mutual fund(s)"] if nw_fund_count else []
+    if nw.get("annual_fund_income", 0) > 0:
+        fund_parts.append(f"~{nw['annual_fund_income'] / 12.0:,.0f} {CCY}/mo expected")
+    meta_by_key = {
+        "stocks": " + ".join(eq_parts) + " · auto-synced",
+        "us_stocks": f"{us_shares_total:g} share(s) · ${nw['usd_stock_usd']:,.2f} USD"
+        if us_stock_items
+        else "Add PCOR / ESPP shares below",
+        "funds": " · ".join(fund_parts) if fund_parts else "Add money-market / fixed-income funds below",
+        "gold": f"{nw['gold_total_grams']:,.1f}g total ({nw['gold_grams_24k']:g}g 24K · {nw['gold_grams_21k']:g}g 21K)"
+        if nw["gold_total_grams"] > 0
+        else "No gold items added",
+        "fx": f"${nw['usd_cash_usd']:,.0f} USD cash" if nw["usd_cash_usd"] > 0 else (f"{fx_count} currency balance(s)" if fx_count else "No FX cash added"),
+        "cd_cash": " · ".join(cd_parts) if cd_parts else "EGP & FX certificates / cash",
+    }
+
+    chart_col, bars_col = st.columns([1, 1.55], gap="large", vertical_alignment="center")
+    with chart_col:
+        st.markdown(_nw_donut_html(nw), unsafe_allow_html=True)
+    with bars_col:
+        st.markdown(_nw_bars_html(nw, meta_by_key), unsafe_allow_html=True)
+
+    # --- Non-Stock Holdings Table (US Stock, Mutual Funds, Gold, FX, CDs, Cash) -------
+    st.subheader("Manual Holdings (US Stock, Mutual Funds, Gold, FX, CDs & Cash)")
+    if not items:
+        st.info(
+            "No manual items added yet. Click **➕ Add Net Worth Item** above "
+            "to add your PCOR/ESPP shares, mutual funds, certificates (EGP or USD/FX), currency balances, or gold."
+        )
+        return
+
+    gold_unpriced = any(it.category == CAT_GOLD for it in items) and p24 == 0 and p21 == 0
+    if gold_unpriced:
+        st.warning("Enter the **24K** or **21K** gold gram price above so your gold items can be valued in EGP.")
+
+    table_rows = []
+    for it in items:
+        val_egp = item_value_egp(it, p24, p21, usd_rate)
+        ccy = item_currency(it)
+        eff_rate = effective_fx_rate(it, usd_rate)
+        if it.category == CAT_GOLD:
+            active_px = p21 if it.karat == 21 else p24
+            qty_str = f"{it.quantity:g} pcs ({it.quantity * it.grams:g}g)"
+            rate_str = f"{it.karat}K @ {active_px:,.0f}/g" + (f" (+{it.unit_value:g}/g)" if it.unit_value > 0 else "")
+        elif it.category == CAT_US_STOCK:
+            native_v = item_native_value(it)
+            qty_str = f"{it.quantity:g} sh (${native_v:,.2f} {ccy})"
+            rate_str = f"${it.unit_value:,.2f}/sh · 1 {ccy} = {eff_rate:,.2f} {CCY}"
+        elif it.category == CAT_FUND:
+            native_v = item_native_value(it)
+            yr_native = item_annual_income_native(it)
+            yr_egp = item_annual_income_egp(it, usd_rate)
+            if it.unit_value > 0:
+                qty_str = f"{it.quantity:,.4g} units ({native_v:,.2f} {ccy})"
+                details = [f"NAV = {it.unit_value:,.4f} {ccy}"]
+            else:
+                qty_str = f"{native_v:,.2f} {ccy}"
+                details = ["Direct balance"]
+            if ccy != "EGP":
+                details.append(f"1 {ccy} = {eff_rate:,.2f} {CCY}")
+            if yr_egp > 0:
+                if ccy != "EGP":
+                    details.append(f"~{it.grams:g}%/yr (~{yr_native / 12.0:,.1f} {ccy} · ~{yr_egp / 12.0:,.0f} {CCY}/mo)")
+                else:
+                    details.append(f"~{it.grams:g}%/yr (~{yr_egp / 12.0:,.0f} {CCY}/mo)")
+            rate_str = " · ".join(details)
+        elif it.category == CAT_FX:
+            qty_str = f"{it.quantity:,.2f} {ccy}"
+            rate_str = f"1 {ccy} = {eff_rate:,.2f} {CCY}"
+        else:
+            qty_str = f"{it.quantity:,.2f} {ccy}"
+            yr_native = item_annual_income_native(it)
+            yr_egp = item_annual_income_egp(it, usd_rate)
+            details = []
+            if ccy != "EGP":
+                details.append(f"1 {ccy} = {eff_rate:,.2f} {CCY}")
+            if yr_egp > 0:
+                if ccy != "EGP":
+                    details.append(f"{it.unit_value:g}%/yr ({yr_native / 12.0:,.1f} {ccy} · {yr_egp / 12.0:,.0f} {CCY}/mo)")
+                else:
+                    details.append(f"{it.unit_value:g}%/yr ({yr_egp / 12.0:,.0f} {CCY}/mo)")
+            rate_str = " · ".join(details) if details else "—"
+
+        table_rows.append(
+            {
+                "Type": _NW_CAT_SHORT.get(it.category, it.category) + (f" ({ccy})" if it.category in (CAT_CD, CAT_CASH, CAT_FUND) and ccy != "EGP" else ""),
+                "Item": it.name,
+                "Principal / Qty": qty_str,
+                "Rate / Details": rate_str,
+                f"Value ({CCY})": val_egp,
+                "Net Worth %": (val_egp / nw["total"] * 100.0) if nw["total"] > 0 else 0.0,
+                "Notes": it.notes or "—",
+            }
+        )
+
+    nw_df = pd.DataFrame(table_rows)
+    event = st.dataframe(
+        nw_df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="nw_table",
+        column_config={
+            f"Value ({CCY})": st.column_config.NumberColumn(format="%.2f"),
+            "Net Worth %": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
+
+    sel = event.selection.rows
+    if not sel:
+        st.caption("Select a row to edit its balance/rate or delete it.")
+        return
+    chosen_row = nw_rows[sel[0]]
+    st.caption(f"Selected: **{_NW_CAT_SHORT.get(chosen_row['category'], '')} · {chosen_row['name']}**")
+    edit_col, del_col, _ = st.columns([1, 1, 4])
+    if edit_col.button("✏️ Edit", key="nw_edit", use_container_width=True):
+        net_worth_dialog(chosen_row, _new_dialog_nonce(), p24, p21, usd_rate)
+    with del_col.popover("🗑 Delete", use_container_width=True):
+        st.write(f"Delete **{chosen_row['name']}**?")
+        if st.button("Confirm delete", type="primary", key="nw_confirm_delete"):
+            store.delete_net_worth_item(int(chosen_row["id"]))
+            st.session_state["toast"] = f"Deleted {chosen_row['name']}."
+            st.rerun()
+
+
+with tab_networth:
+    net_worth_tab(positions, fund_symbols, all_nw_rows)
+

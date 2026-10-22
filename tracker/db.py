@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from .networth import NetWorthItem
 from .portfolio import Dividend, Transaction
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "portfolio.db"
@@ -84,8 +85,51 @@ class Store:
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS net_worth_items (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                category   TEXT    NOT NULL CHECK (category IN ('gold', 'fx', 'cd', 'cash', 'fund', 'us_stock')),
+                name       TEXT    NOT NULL,
+                quantity   REAL    NOT NULL CHECK (quantity >= 0),
+                unit_value REAL    NOT NULL DEFAULT 0 CHECK (unit_value >= 0),
+                karat      INTEGER NOT NULL DEFAULT 24 CHECK (karat IN (21, 24)),
+                grams      REAL    NOT NULL DEFAULT 0 CHECK (grams >= 0),
+                currency   TEXT    NOT NULL DEFAULT 'EGP',
+                fx_rate    REAL    NOT NULL DEFAULT 1.0 CHECK (fx_rate >= 0),
+                notes      TEXT    NOT NULL DEFAULT ''
+            );
             """
             )
+            nw_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(net_worth_items)")}
+            if "currency" not in nw_cols:
+                self._conn.execute("ALTER TABLE net_worth_items ADD COLUMN currency TEXT NOT NULL DEFAULT 'EGP'")
+            if "fx_rate" not in nw_cols:
+                self._conn.execute("ALTER TABLE net_worth_items ADD COLUMN fx_rate REAL NOT NULL DEFAULT 1.0")
+            nw_sql = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='net_worth_items'"
+            ).fetchone()
+            if nw_sql and "'us_stock'" not in nw_sql[0]:
+                self._conn.executescript(
+                    """
+                    ALTER TABLE net_worth_items RENAME TO _net_worth_items_old;
+                    CREATE TABLE net_worth_items (
+                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        category   TEXT    NOT NULL CHECK (category IN ('gold', 'fx', 'cd', 'cash', 'fund', 'us_stock')),
+                        name       TEXT    NOT NULL,
+                        quantity   REAL    NOT NULL CHECK (quantity >= 0),
+                        unit_value REAL    NOT NULL DEFAULT 0 CHECK (unit_value >= 0),
+                        karat      INTEGER NOT NULL DEFAULT 24 CHECK (karat IN (21, 24)),
+                        grams      REAL    NOT NULL DEFAULT 0 CHECK (grams >= 0),
+                        currency   TEXT    NOT NULL DEFAULT 'EGP',
+                        fx_rate    REAL    NOT NULL DEFAULT 1.0 CHECK (fx_rate >= 0),
+                        notes      TEXT    NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO net_worth_items (id, category, name, quantity, unit_value, karat, grams, currency, fx_rate, notes)
+                    SELECT id, category, name, quantity, unit_value, karat, grams, currency, fx_rate, notes
+                    FROM _net_worth_items_old;
+                    DROP TABLE _net_worth_items_old;
+                    """
+                )
             # An older version of the app kept a differently-shaped `price_history` table.
             # Copy its rows into daily_closes (never modifying or dropping the old table).
             legacy_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(price_history)")}
@@ -267,6 +311,100 @@ class Store:
         with self._lock:
             rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
         return {r["key"]: r["value"] for r in rows}
+
+    # --- net worth items (gold, fx, certificates, cash) -----------------------------
+    def add_net_worth_item(
+        self,
+        category: str,
+        name: str,
+        quantity: float,
+        unit_value: float = 0.0,
+        karat: int = 24,
+        grams: float = 0.0,
+        notes: str = "",
+        currency: str = "EGP",
+        fx_rate: float = 1.0,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO net_worth_items "
+                "(category, name, quantity, unit_value, karat, grams, currency, fx_rate, notes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    category.strip().lower(),
+                    name.strip(),
+                    float(quantity),
+                    float(unit_value),
+                    int(karat),
+                    float(grams),
+                    currency.strip().upper() or "EGP",
+                    float(fx_rate),
+                    notes.strip(),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def update_net_worth_item(
+        self,
+        item_id: int,
+        category: str,
+        name: str,
+        quantity: float,
+        unit_value: float = 0.0,
+        karat: int = 24,
+        grams: float = 0.0,
+        notes: str = "",
+        currency: str = "EGP",
+        fx_rate: float = 1.0,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE net_worth_items SET category = ?, name = ?, quantity = ?, unit_value = ?, "
+                "karat = ?, grams = ?, currency = ?, fx_rate = ?, notes = ? WHERE id = ?",
+                (
+                    category.strip().lower(),
+                    name.strip(),
+                    float(quantity),
+                    float(unit_value),
+                    int(karat),
+                    float(grams),
+                    currency.strip().upper() or "EGP",
+                    float(fx_rate),
+                    notes.strip(),
+                    int(item_id),
+                ),
+            )
+            self._conn.commit()
+
+    def delete_net_worth_item(self, item_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM net_worth_items WHERE id = ?", (int(item_id),))
+            self._conn.commit()
+
+    def list_net_worth_items(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM net_worth_items ORDER BY category, id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def net_worth_items(self) -> list[NetWorthItem]:
+        return [
+            NetWorthItem(
+                id=int(r["id"]),
+                category=r["category"],
+                name=r["name"],
+                quantity=float(r["quantity"]),
+                unit_value=float(r["unit_value"]),
+                karat=int(r["karat"]),
+                grams=float(r["grams"]),
+                currency=str(r.get("currency") or "EGP"),
+                fx_rate=float(r.get("fx_rate") if r.get("fx_rate") is not None else 1.0),
+                notes=r["notes"],
+            )
+            for r in self.list_net_worth_items()
+        ]
 
     # --- price history -------------------------------------------------------------
     def upsert_price_history(self, symbol: str, points: list[tuple[str, float]]) -> int:

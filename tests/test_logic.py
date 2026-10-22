@@ -236,7 +236,9 @@ class AppStructureTests(unittest.TestCase):
     def test_dialogs_do_not_read_late_bound_globals(self):
         # Streamlit re-runs a dialog on its own, without re-executing the script. A dialog that reads a
         # module global assigned later in the script (like the fund list) crashes with NameError.
-        for fn in ("_company_picker", "transaction_dialog", "dividend_dialog", "sell_planner", "dca_tab"):
+        for fn in (
+            "_company_picker", "transaction_dialog", "dividend_dialog", "sell_planner", "dca_tab", "net_worth_dialog"
+        ):
             self.assertNotIn("fund_symbols", self._names(self.funcs[fn]), f"{fn} reads the global fund_symbols")
 
     def test_every_eodhd_call_is_guarded_against_funds(self):
@@ -377,6 +379,111 @@ class RealLedgerTests(unittest.TestCase):
         curve = equity_curve(txns, {}, end=max(t.date for t in txns))
         # net cash contributed must equal the engine's net invested (ex-dividends).
         self.assertAlmostEqual(curve[-1]["contributed"], sum(p.net_invested for p in positions), places=4)
+
+
+class NetWorthTests(unittest.TestCase):
+    def test_effective_gold_prices_derives_missing_karat(self):
+        from tracker.networth import effective_gold_prices
+
+        self.assertEqual(effective_gold_prices(4800.0, 0.0), (4800.0, 4200.0))
+        self.assertEqual(effective_gold_prices(0.0, 4200.0), (4800.0, 4200.0))
+        self.assertEqual(effective_gold_prices(4800.0, 4215.0), (4800.0, 4215.0))
+        self.assertEqual(effective_gold_prices(0.0, 0.0), (0.0, 0.0))
+
+    def test_compute_net_worth_across_all_asset_classes(self):
+        from tracker.networth import (
+            CAT_CASH, CAT_CD, CAT_FUND, CAT_FX, CAT_GOLD, NetWorthItem, compute_net_worth,
+        )
+
+        txns = [
+            T("ABUK", BUY, 100, 90.0, "2026-01-01"),
+            T("NBE05", BUY, 1000, 50.0, "2026-01-01"),
+        ]
+        positions = compute_positions(txns, (), {"ABUK": 100.0, "NBE05": 55.0})
+        items = [
+            NetWorthItem(1, CAT_GOLD, "Gold Pound (8g · 21K)", quantity=2.0, unit_value=25.0, karat=21, grams=8.0),
+            NetWorthItem(2, CAT_GOLD, "10g Bar (24K)", quantity=1.0, unit_value=30.0, karat=24, grams=10.0),
+            NetWorthItem(3, CAT_FX, "USD", quantity=1000.0, unit_value=50.0),
+            NetWorthItem(4, CAT_CD, "NBE 27% CD", quantity=200000.0, unit_value=27.0),
+            NetWorthItem(5, CAT_CASH, "Savings", quantity=10000.0, unit_value=0.0),
+            NetWorthItem(6, CAT_FUND, "Beltone BMM (direct)", quantity=30000.0, unit_value=0.0, grams=20.0),
+            NetWorthItem(7, CAT_FUND, "Azimut Fund (units)", quantity=500.0, unit_value=40.0, grams=22.0),
+        ]
+        # 24K = 4800 -> derived 21K = 4200
+        # Gold Pound:   2 * 8g * (4200 + 25) = 67,600
+        # 10g Bar:      1 * 10g * (4800 + 30) = 48,300 -> total gold = 115,900
+        # FX:           1000 * 50 = 50,000
+        # CD+Cash:      200,000 + 10,000 = 210,000
+        # Equities:     ABUK (100 * 100 = 10,000) + NBE05 stock fund (1000 * 55 = 55,000) = 65,000
+        # Mutual Funds: 30,000 + (500 * 40 = 20,000) = 50,000
+        # Fund income:  30,000 * 20% (6,000) + 20,000 * 22% (4,400) = 10,400
+        nw = compute_net_worth(positions, ["NBE05"], items, price_24k=4800.0, price_21k=0.0)
+        self.assertAlmostEqual(nw["by_key"]["stocks"], 65000.0)
+        self.assertAlmostEqual(nw["stocks_only_egp"], 10000.0)
+        self.assertAlmostEqual(nw["stock_funds_egp"], 55000.0)
+        self.assertAlmostEqual(nw["by_key"]["funds"], 50000.0)
+        self.assertAlmostEqual(nw["by_key"]["gold"], 115900.0)
+        self.assertAlmostEqual(nw["by_key"]["fx"], 50000.0)
+        self.assertAlmostEqual(nw["by_key"]["cd_cash"], 210000.0)
+        self.assertAlmostEqual(nw["total"], 490900.0)
+        self.assertAlmostEqual(nw["gold_grams_21k"], 16.0)
+        self.assertAlmostEqual(nw["gold_grams_24k"], 10.0)
+        self.assertAlmostEqual(nw["gold_total_grams"], 26.0)
+        self.assertAlmostEqual(nw["annual_cd_income"], 54000.0)
+        self.assertAlmostEqual(nw["annual_fund_income"], 10400.0)
+        self.assertAlmostEqual(sum(s["pct"] for s in nw["slices"]), 100.0)
+
+    def test_store_crud_for_net_worth_items(self):
+        import tempfile
+        from tracker.db import Store
+        from tracker.networth import CAT_CD, CAT_FUND, CAT_FX, CAT_GOLD
+
+        s = Store(Path(tempfile.mkdtemp()) / "nw.db")
+        self.assertEqual(s.list_net_worth_items(), [])
+        gid = s.add_net_worth_item(CAT_GOLD, "Gold Pound (8g · 21K)", 3.0, 20.0, karat=21, grams=8.0, notes="BTC")
+        fid = s.add_net_worth_item(CAT_FX, "USD", 1500.0, 49.5, notes="CIB")
+        cid = s.add_net_worth_item(CAT_CD, "NBE CD", 100000.0, 27.0)
+        mid = s.add_net_worth_item(CAT_FUND, "BMM", 50000.0, 0.0)
+        items = s.net_worth_items()
+        self.assertEqual(len(items), 4)
+
+        s.update_net_worth_item(fid, CAT_FX, "USD", 2000.0, 50.0, notes="CIB updated")
+        by_id = {it.id: it for it in s.net_worth_items()}
+        self.assertAlmostEqual(by_id[fid].quantity, 2000.0)
+        self.assertAlmostEqual(by_id[fid].unit_value, 50.0)
+        self.assertEqual(by_id[fid].notes, "CIB updated")
+
+        s.delete_net_worth_item(cid)
+        self.assertEqual({it.id for it in s.net_worth_items()}, {gid, fid, mid})
+
+    def test_usd_certificate_and_currency_exposure_breakdown(self):
+        from tracker.networth import CAT_CD, CAT_FX, CAT_US_STOCK, NetWorthItem, compute_net_worth
+
+        txns = [T("ABUK", BUY, 1000, 100.0, "2026-01-01")]  # 100,000 EGP in stocks
+        positions = compute_positions(txns, (), {"ABUK": 100.0})
+        items = [
+            NetWorthItem(1, CAT_FX, "USD", quantity=1000.0, unit_value=50.0, currency="USD", fx_rate=50.0),
+            NetWorthItem(2, CAT_CD, "NBE USD CD", quantity=3000.0, unit_value=6.0, currency="USD", fx_rate=50.0),
+            NetWorthItem(3, CAT_CD, "BM EGP CD", quantity=100000.0, unit_value=27.0, currency="EGP", fx_rate=1.0),
+            NetWorthItem(4, CAT_US_STOCK, "PCOR", quantity=20.0, unit_value=50.0, currency="USD", fx_rate=50.0),
+        ]
+        # PCOR: 20 shares * $50 = $1,000 USD = 50,000 EGP
+        # Total = 100k (EGX) + 50k (PCOR) + 50k (USD cash) + 150k (USD CD) + 100k (EGP CD) = 450,000 EGP
+        # Total USD = 1000 (cash) + 3000 (CD) + 1000 (PCOR) = 5000 USD = 250,000 EGP
+        # Annual CD income = 3000 * 6% * 50 (9,000 EGP) + 100,000 * 27% (27,000 EGP) = 36,000 EGP
+        nw = compute_net_worth(positions, [], items, usd_egp_rate=50.0)
+        self.assertAlmostEqual(nw["total"], 450000.0)
+        self.assertAlmostEqual(nw["by_key"]["us_stocks"], 50000.0)
+        self.assertAlmostEqual(nw["by_key"]["cd_cash"], 250000.0)
+        self.assertAlmostEqual(nw["usd_stock_usd"], 1000.0)
+        self.assertAlmostEqual(nw["usd_cash_usd"], 1000.0)
+        self.assertAlmostEqual(nw["usd_cd_usd"], 3000.0)
+        self.assertAlmostEqual(nw["usd_total_usd"], 5000.0)
+        self.assertAlmostEqual(nw["usd_total_egp"], 250000.0)
+        self.assertAlmostEqual(nw["usd_pct"], 250000.0 / 450000.0 * 100.0)
+        self.assertAlmostEqual(nw["egp_exposure_egp"], 200000.0)
+        self.assertAlmostEqual(nw["egp_pct"], 200000.0 / 450000.0 * 100.0)
+        self.assertAlmostEqual(nw["annual_cd_income"], 36000.0)
 
 
 if __name__ == "__main__":
