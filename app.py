@@ -22,15 +22,19 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import tracker.db as _db_mod
+import tracker.market as _mkt_mod
 import tracker.networth as _nw_mod
+import tracker.nw_insights as _nwi_mod
 
 _saved_defaults = _db_mod.Store.__init__.__defaults__
 importlib.reload(_nw_mod)
+importlib.reload(_nwi_mod)
+importlib.reload(_mkt_mod)
 importlib.reload(_db_mod)
 _db_mod.Store.__init__.__defaults__ = _saved_defaults
 
 from tracker import BUY, SELL, Transaction, compute_positions, companies
-from tracker.db import Store
+from tracker.db import Store, now_iso
 from tracker import performance as perf
 from tracker.actions import apply_corporate_actions, resolve_actions
 from tracker.assets import fund_list, stale_navs, stock_symbols
@@ -49,6 +53,7 @@ from tracker.networth import (
     CAT_FUND,
     CAT_FX,
     CAT_GOLD,
+    CAT_LIABILITY,
     CAT_US_STOCK,
     CD_CURRENCIES,
     COMMON_CURRENCIES,
@@ -61,6 +66,7 @@ from tracker.networth import (
     effective_gold_prices,
     item_annual_income_egp,
     item_annual_income_native,
+    item_annual_interest_cost_egp,
     item_currency,
     item_native_value,
     item_value_egp,
@@ -68,6 +74,8 @@ from tracker.networth import (
     snapshot_from_nw,
     snapshot_usd_exposure,
 )
+from tracker import nw_insights as nwi
+from tracker.market import USD_EGP_CODE, fetch_realtime_price, us_stock_code
 from tracker.portfolio import Dividend
 from tracker.prices import fetch_latest_eodhd_close
 
@@ -86,7 +94,7 @@ st.set_page_config(page_title="Portfolio & Stock Tracker", page_icon=":chart_wit
 
 
 @st.cache_resource
-def get_store(_schema_version: int = 5) -> Store:
+def get_store(_schema_version: int = 6) -> Store:
     s = Store()
     s.data_version = 0
 
@@ -104,7 +112,7 @@ def get_store(_schema_version: int = 5) -> Store:
         "add_dividend", "update_dividend", "delete_dividend", "set_price",
         "add_corporate_action", "delete_corporate_action", "upsert_price_history", "set_fund",
         "set_setting", "add_net_worth_item", "update_net_worth_item", "delete_net_worth_item",
-        "upsert_net_worth_snapshot", "delete_net_worth_snapshot",
+        "upsert_net_worth_snapshot", "delete_net_worth_snapshot", "set_net_worth_item_price",
     ):
         setattr(s, name, _invalidating(getattr(s, name)))
     return s
@@ -412,6 +420,14 @@ def setting_float(key: str, default: float) -> float:
         return default
 
 
+def setting_opt(key: str) -> float | None:
+    """A saved optional numeric preference, or ``None`` when unset/blank (e.g. a cleared target)."""
+    try:
+        return float(app_settings[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def live_funds() -> set:
     """Fund flags read straight from the database, never from a cached/stale copy.
 
@@ -450,9 +466,19 @@ def _save_setting(widget_key: str, setting_key: str) -> None:
     store.set_setting(setting_key, st.session_state[widget_key])
 
 
+# Freshness timestamp recorded alongside each manually-entered market rate.
+_RATE_STAMP_KEYS = {
+    "usd_egp_rate": "usd_egp_rate_updated_at",
+    "gold_24k_price": "gold_price_updated_at",
+    "gold_21k_price": "gold_price_updated_at",
+}
+
+
 def _save_nw_setting(widget_key: str, setting_key: str) -> None:
     """on_change callback for Net Worth rates (gold / USD): save setting and update today's snapshot."""
     store.set_setting(setting_key, st.session_state[widget_key])
+    if setting_key in _RATE_STAMP_KEYS:
+        store.set_setting(_RATE_STAMP_KEYS[setting_key], now_iso())
     record_current_snapshot()
 txns = [
     Transaction(
@@ -1645,6 +1671,7 @@ with tab_perf:
 
 
 # --- Net Worth tab --------------------------------------------------------------
+_NW_RESET_KEY = "_nw_reset_widgets"  # widget keys to drop on the next full run (so they re-read saved settings)
 _NW_CAT_LABELS = {
     CAT_US_STOCK: "🌎 US / Employer Stock (e.g. PCOR / ESPP)",
     CAT_FUND: "📊 Mutual Fund (Money Market / Fixed Income / Savings)",
@@ -1652,6 +1679,7 @@ _NW_CAT_LABELS = {
     CAT_FX: "💵 Foreign Currency (Cash)",
     CAT_CD: "📜 Certificate of Deposit (CD — EGP or Foreign Currency)",
     CAT_CASH: "🏦 Cash / Savings Account",
+    CAT_LIABILITY: "💳 Debt / Liability (Loan, Credit Card, Installments)",
 }
 _NW_CAT_SHORT = {
     CAT_US_STOCK: "🌎 US Stock",
@@ -1660,7 +1688,15 @@ _NW_CAT_SHORT = {
     CAT_FX: "💵 FX",
     CAT_CD: "📜 CD",
     CAT_CASH: "🏦 Cash",
+    CAT_LIABILITY: "💳 Debt",
 }
+
+
+def _parse_iso_date(value: object) -> date | None:
+    try:
+        return date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
 
 
 @st.dialog("🏦 Net Worth Item", width="large")
@@ -1670,7 +1706,7 @@ def net_worth_dialog(
     """Add (item=None) or edit a non-stock asset (US Stock, Mutual Fund, Gold, FX, CD, or Cash)."""
     editing = item is not None
     p = f"nw{nonce}_"
-    cats = [CAT_US_STOCK, CAT_FUND, CAT_GOLD, CAT_FX, CAT_CD, CAT_CASH]
+    cats = [CAT_US_STOCK, CAT_FUND, CAT_GOLD, CAT_FX, CAT_CD, CAT_CASH, CAT_LIABILITY]
     default_cat = item["category"] if editing and item["category"] in cats else CAT_US_STOCK
     category = st.selectbox(
         "Asset category",
@@ -1686,6 +1722,9 @@ def net_worth_dialog(
     unit_value = 0.0
     currency = "EGP"
     fx_rate = 1.0
+    maturity_date = ""
+    monthly_amount = 0.0
+    saved_maturity = _parse_iso_date(item.get("maturity_date")) if editing else None
 
     if category == CAT_US_STOCK:
         currency = "USD"
@@ -2013,6 +2052,102 @@ def net_worth_dialog(
         unit_value = fx_rate
         st.caption(f"Value in {CCY}: **{quantity * fx_rate:,.2f} {CCY}**")
 
+    elif category == CAT_LIABILITY:
+        name_col, ccy_col = st.columns([2.2, 1])
+        name = name_col.text_input(
+            "Debt name / Lender",
+            value=item["name"] if editing else "",
+            placeholder="e.g. Car loan (NBE) · CIB credit card · valU installments",
+            key=f"{p}debt_name",
+        ).strip()
+        debt_curr_opts = list(CD_CURRENCIES) + [OTHER]
+        existing_ccy = (item.get("currency") or "EGP").upper() if editing else "EGP"
+        default_debt_ccy = existing_ccy if existing_ccy in CD_CURRENCIES else OTHER
+        picked_ccy = ccy_col.selectbox(
+            "Currency",
+            debt_curr_opts,
+            index=debt_curr_opts.index(default_debt_ccy),
+            format_func=lambda s: "Other…" if s == OTHER else s,
+            key=f"{p}debt_ccy",
+        )
+        if picked_ccy == OTHER:
+            currency = st.text_input(
+                "Currency code",
+                value=existing_ccy if editing and existing_ccy not in CD_CURRENCIES else "",
+                placeholder="e.g. CAD",
+                key=f"{p}debt_ccy_custom",
+            ).strip().upper() or "EGP"
+        else:
+            currency = picked_ccy
+
+        if currency == "EGP":
+            c1, c2, c3 = st.columns(3)
+            fx_rate = 1.0
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            default_fx = (
+                float(usd_egp_rate)
+                if currency == "USD" and usd_egp_rate > 0
+                else (float(item.get("fx_rate") or 50.0) if editing and float(item.get("fx_rate") or 0) > 1.0 else 50.0)
+            )
+            fx_rate = float(
+                c4.number_input(
+                    f"Rate ({CCY} per 1 {currency})",
+                    min_value=0.0,
+                    step=0.1,
+                    format="%.4f",
+                    value=default_fx,
+                    key=f"{p}debt_fx_rate",
+                )
+            )
+        quantity = float(
+            c1.number_input(
+                f"Outstanding balance ({currency})",
+                min_value=0.0,
+                step=1000.0 if currency == "EGP" else 100.0,
+                format="%.2f",
+                value=float(item["quantity"]) if editing else 0.0,
+                key=f"{p}debt_qty",
+                help="What you still owe today (update it as you pay it down).",
+            )
+        )
+        unit_value = float(
+            c2.number_input(
+                "Interest rate (% / yr)",
+                min_value=0.0,
+                max_value=200.0,
+                step=0.25,
+                format="%.2f",
+                value=float(item["unit_value"]) if editing else 0.0,
+                key=f"{p}debt_rate",
+                help="Use 0 for interest-free installments.",
+            )
+        )
+        monthly_amount = float(
+            c3.number_input(
+                f"Monthly installment ({currency}, optional)",
+                min_value=0.0,
+                step=100.0,
+                format="%.2f",
+                value=float(item.get("monthly_amount") or 0.0) if editing else 0.0,
+                key=f"{p}debt_monthly",
+            )
+        )
+        payoff = st.date_input(
+            "Payoff / final installment date (optional)",
+            value=saved_maturity,
+            min_value=date(2000, 1, 1),
+            key=f"{p}debt_payoff",
+        )
+        maturity_date = payoff.isoformat() if payoff else ""
+        owed_egp = quantity * fx_rate
+        parts = [f"Reduces net worth by **{owed_egp:,.2f} {CCY}**"]
+        if quantity > 0 and unit_value > 0:
+            parts.append(f"Interest cost ≈ **{owed_egp * unit_value / 100.0 / 12.0:,.0f} {CCY}/mo**")
+        if monthly_amount > 0:
+            parts.append(f"Installment: **{monthly_amount * fx_rate:,.0f} {CCY}/mo**")
+        st.caption(" · ".join(parts))
+
     else:
         is_cd = category == CAT_CD
         name_col, ccy_col = st.columns([2.2, 1])
@@ -2099,6 +2234,15 @@ def net_worth_dialog(
                 else:
                     parts.append(f"Payout: **{yr_egp:,.0f} {CCY}/yr** (**{yr_egp / 12.0:,.0f} {CCY}/mo**)")
             st.caption(" · ".join(parts))
+        if is_cd:
+            matures = st.date_input(
+                "Maturity date (optional)",
+                value=saved_maturity,
+                min_value=date(2000, 1, 1),
+                key=f"{p}cd_maturity",
+                help="Used for the maturity calendar and a reminder 30 days before the CD ends.",
+            )
+            maturity_date = matures.isoformat() if matures else ""
 
     notes = st.text_input(
         "Notes (optional)",
@@ -2121,15 +2265,19 @@ def net_worth_dialog(
         else:
             if currency == "USD" and fx_rate > 0 and abs(fx_rate - usd_egp_rate) > 1e-6:
                 store.set_setting("usd_egp_rate", fx_rate)
+                store.set_setting("usd_egp_rate_updated_at", now_iso())
+                st.session_state[_NW_RESET_KEY] = ["nw_usd_rate"]
+            extra = {"maturity_date": maturity_date, "monthly_amount": monthly_amount}
             if editing:
                 store.update_net_worth_item(
-                    int(item["id"]), category, name, quantity, unit_value, karat, grams, notes, currency, fx_rate
+                    int(item["id"]), category, name, quantity, unit_value, karat, grams, notes, currency, fx_rate,
+                    **extra,
                 )
                 record_current_snapshot()
                 st.session_state["toast"] = f"Updated {name}."
             else:
                 store.add_net_worth_item(
-                    category, name, quantity, unit_value, karat, grams, notes, currency, fx_rate
+                    category, name, quantity, unit_value, karat, grams, notes, currency, fx_rate, **extra
                 )
                 record_current_snapshot()
                 st.session_state["toast"] = f"Added {name} to Net Worth."
@@ -2246,10 +2394,36 @@ def nw_snapshot_dialog(
             key=f"{p}{iso}_cd_cash",
         )
     )
-    total_v = round(stocks_v + us_stocks_v + funds_v + gold_v + fx_v + cd_cash_v, 2)
+    c7, c8 = st.columns(2)
+    liab_v = float(
+        c7.number_input(
+            f"💳 Debts owed ({CCY})",
+            min_value=0.0,
+            step=1000.0,
+            format="%.2f",
+            value=float(defaults.get("liabilities_egp") or 0.0),
+            key=f"{p}{iso}_liab",
+            help="Outstanding loans / credit cards / installments on that date. Subtracted from the total.",
+        )
+    )
+    default_rate = float(defaults.get("usd_egp_rate") or 0.0) or float(live_nw.get("usd_egp_rate") or 0.0)
+    rate_v = float(
+        c8.number_input(
+            f"💵 USD rate on {iso} ({CCY} / $1)",
+            min_value=0.0,
+            step=0.25,
+            format="%.4f",
+            value=default_rate,
+            key=f"{p}{iso}_rate",
+            help="Recorded with the snapshot so history can be shown in USD and FX moves can be separated "
+                 "from real gains. Changing it does not re-value the slices above — adjust those too.",
+        )
+    )
+
+    total_v = round(stocks_v + us_stocks_v + funds_v + gold_v + fx_v + cd_cash_v - liab_v, 2)
     edited_slices = {
         "stocks_egp": stocks_v, "us_stocks_egp": us_stocks_v, "funds_egp": funds_v,
-        "gold_egp": gold_v, "fx_egp": fx_v, "cd_cash_egp": cd_cash_v,
+        "gold_egp": gold_v, "fx_egp": fx_v, "cd_cash_egp": cd_cash_v, "liabilities_egp": liab_v,
     }
     auto_usd_v = snapshot_usd_exposure(edited_slices, defaults, live_nw)
     override_usd = st.checkbox(
@@ -2262,8 +2436,7 @@ def nw_snapshot_dialog(
     if override_usd:
         usd_total_v = float(
             st.number_input(
-                f"🇺🇸 Total USD Exposure included above (in {CCY})",
-                min_value=0.0,
+                f"🇺🇸 Net USD Exposure included above (in {CCY})",
                 step=1000.0,
                 format="%.2f",
                 value=auto_usd_v,
@@ -2282,8 +2455,8 @@ def nw_snapshot_dialog(
         use_container_width=True,
         key=f"{p}save",
     ):
-        if total_v <= 0:
-            st.error("Total Net Worth must be greater than zero.")
+        if total_v + liab_v <= 0:
+            st.error("Enter at least one asset value.")
         else:
             store.upsert_net_worth_snapshot(
                 {
@@ -2296,6 +2469,11 @@ def nw_snapshot_dialog(
                     "fx_egp": fx_v,
                     "cd_cash_egp": cd_cash_v,
                     "usd_total_egp": usd_total_v,
+                    "liabilities_egp": liab_v,
+                    "usd_egp_rate": rate_v,
+                    "usd_total_usd": (usd_total_v / rate_v) if rate_v > 0 else 0.0,
+                    "gold_24k_price": float(defaults.get("gold_24k_price") or 0.0)
+                    or float(live_nw.get("gold_24k_price") or 0.0),
                 }
             )
             st.session_state["toast"] = f"Saved Net Worth snapshot for {iso} ({total_v:,.0f} {CCY})."
@@ -2319,6 +2497,21 @@ def _nw_bars_html(nw: dict, meta_by_key: dict[str, str]) -> str:
             + (f"<br>{_esc(sub)}" if sub else "")
             + "</div></div>"
         )
+    liab = float(nw.get("liabilities_egp", 0.0))
+    if liab > 0:
+        gross = float(nw.get("gross_assets", 0.0)) or 1.0
+        liab_pct = liab / gross * 100.0
+        sub = meta_by_key.get("liabilities", "")
+        rows.append(
+            "<div class='al-row' style='grid-template-columns:175px 1fr 64px 200px;border-left-color:#e74c3c'>"
+            "<div class='al-id'><span style='display:inline-block;width:10px;height:10px;border-radius:50%;background:#e74c3c'></span>"
+            "Debts (owed)</div>"
+            f"<div class='al-track'><div class='al-fill' style='width:{min(liab_pct / max_pct * 100.0, 100.0):.1f}%;background:#e74c3c'></div></div>"
+            f"<div class='al-w'>−{liab_pct:.1f}%</div>"
+            f"<div class='al-meta'><strong style='color:#e74c3c'>−{egx_money(liab)}</strong>"
+            + (f"<br>{_esc(sub)}" if sub else "")
+            + "</div></div>"
+        )
 
     # Currency & Hedge Exposure summary card (shows exact % of Net Worth in EGP vs USD vs Gold)
     usd_parts = []
@@ -2330,13 +2523,16 @@ def _nw_bars_html(nw: dict, meta_by_key: dict[str, str]) -> str:
         usd_parts.append(f"${nw['usd_cd_usd']:,.0f} in CDs")
     if nw.get("usd_fund_usd", 0) > 0:
         usd_parts.append(f"${nw['usd_fund_usd']:,.0f} in funds")
+    if nw.get("usd_liab_usd", 0) > 0:
+        usd_parts.append(f"−${nw['usd_liab_usd']:,.0f} USD debt")
     usd_detail = (
         f"${nw['usd_total_usd']:,.2f} total (" + " · ".join(usd_parts) + ")"
-        if nw["usd_total_usd"] > 0
+        if nw["usd_total_usd"] != 0
         else "No USD held"
     )
     exposure_items = [
-        ("🇪🇬 EGP Assets", nw["egp_pct"], nw["egp_exposure_egp"], "#2ecc71", "Equities, EGP Funds & EGP CDs/Cash"),
+        ("🇪🇬 EGP Assets", nw["egp_pct"], nw["egp_exposure_egp"], "#2ecc71",
+         "Equities, EGP Funds & EGP CDs/Cash" + (" − EGP debts" if nw.get("liabilities_egp", 0) > nw.get("usd_liab_egp", 0) else "")),
         ("🇺🇸 USD Exposure", nw["usd_pct"], nw["usd_total_egp"], "#3498db", usd_detail),
         ("🪙 Gold Exposure", nw["gold_pct"], nw["by_key"]["gold"], "#f1c40f", f"{nw['gold_total_grams']:,.1f}g total"),
     ]
@@ -2373,6 +2569,379 @@ def _nw_bars_html(nw: dict, meta_by_key: dict[str, str]) -> str:
     return "".join(rows) + exposure_card
 
 
+
+
+def _ago(updated_at: object) -> str:
+    age = nwi.age_days(updated_at, cairo_today())
+    if age is None:
+        return "no update date"
+    if age <= 0:
+        return "updated today"
+    return "updated yesterday" if age == 1 else f"updated {age} days ago"
+
+
+def _age_text(age: int | None) -> str:
+    return "no date recorded" if age is None else f"{age} days old"
+
+
+def _cfg_opt(cfg: dict, key: str) -> float | None:
+    try:
+        return float(cfg[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _signed_money(v: float | None) -> str:
+    if v is None:
+        return "—"
+    sign = "+" if v > 0 else ("−" if v < 0 else "")
+    return f"{sign}{abs(v):,.0f} {CCY}"
+
+
+def _commas(df: pd.DataFrame, formats: dict):
+    """Styler that shows thousands separators (printf-style NumberColumn formats can't add commas).
+
+    ``formats`` maps column -> format spec, e.g. ``"{:,.0f}"``; missing values show as "—".
+    """
+    return df.style.format({c: (lambda v, f=f: "—" if pd.isna(v) else f.format(v)) for c, f in formats.items()})
+
+
+def _refresh_market_prices(items: list, api_key: str) -> str:
+    """Fetch USD/EGP and US stock prices from EODHD, save them, and return a summary message.
+
+    Only the USDEGP forex pair and US tickers are requested — never EGX symbols or funds.
+    """
+    ts = now_iso()
+    us_items = [it for it in items if it.category == CAT_US_STOCK and it.quantity > 0]
+    tickers = sorted({nwi.us_ticker(it.name) for it in us_items} - {""})
+    codes = [USD_EGP_CODE] + [us_stock_code(t) for t in tickers]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        quotes = dict(zip(codes, pool.map(lambda c: fetch_realtime_price(c, api_key), codes)))
+    parts: list[str] = []
+    failed: list[str] = []
+    rate = quotes.get(USD_EGP_CODE)
+    if rate:
+        rate = round(rate, 4)
+        store.set_setting("usd_egp_rate", rate)
+        store.set_setting("usd_egp_rate_updated_at", ts)
+        st.session_state[_NW_RESET_KEY] = ["nw_usd_rate"]
+        parts.append(f"USD rate {rate:,.2f} {CCY}")
+    else:
+        failed.append("USD/EGP")
+    for t in tickers:
+        px = quotes.get(us_stock_code(t))
+        if not px:
+            failed.append(t)
+            continue
+        for it in us_items:
+            if nwi.us_ticker(it.name) == t:
+                store.set_net_worth_item_price(it.id, round(px, 4), ts)
+        parts.append(f"{t} ${px:,.2f}")
+    if parts:
+        record_current_snapshot()
+    msg = ("Updated " + " · ".join(parts) + ".") if parts else "No prices were returned by EODHD."
+    if failed:
+        msg += " Couldn't fetch: " + ", ".join(failed) + "."
+    return msg
+
+
+def _nw_changes_section(nw: dict, nw_snapshots: list[dict], adj_txns, today_iso: str, cfg: dict) -> None:
+    """'What changed' — today's live net worth vs a saved snapshot, split into its drivers."""
+    st.subheader("🔍 What Changed")
+    past = [r for r in nw_snapshots if str(r["date"])[:10] < today_iso]
+    if not past:
+        st.info("Once you have a snapshot from an earlier day, this section explains what moved your net worth since then.")
+        return
+    by_date = {str(r["date"])[:10]: r for r in past}
+    dates = sorted(by_date, reverse=True)
+    c1, c2, _ = st.columns([1.3, 1.3, 2])
+    picked = c1.selectbox(
+        "Compare today with",
+        dates,
+        index=0,
+        format_func=lambda d: f"{d}  ({(date.fromisoformat(today_iso) - date.fromisoformat(d)).days} days ago)",
+        key="nw_cmp_date",
+    )
+    inflation = c2.number_input(
+        "Annual inflation (%)",
+        min_value=0.0,
+        max_value=200.0,
+        step=0.5,
+        format="%.1f",
+        value=_cfg_opt(cfg, "nw_inflation_pct"),
+        placeholder="e.g. 12.0",
+        key="nw_inflation",
+        on_change=_save_setting,
+        args=("nw_inflation", "nw_inflation_pct"),
+        help="Use **headline** annual urban inflation (CAPMAS / CBE monthly release), not core — headline includes "
+             "food and energy, which you actually pay for. Used to show whether your net worth grew in real terms.",
+    )
+    prev = by_date[picked]
+    cur = snapshot_from_nw(today_iso, nw)
+    days = (date.fromisoformat(today_iso) - date.fromisoformat(picked)).days
+    invested = nwi.egx_net_invested(adj_txns, picked, today_iso)
+    bd = nwi.change_breakdown(prev, cur, invested)
+
+    m1, m2, m3 = st.columns(3)
+    pct_txt = f"{bd['total_change_pct']:+.2f}%" if bd["total_change_pct"] is not None else None
+    m1.metric(f"Change in {CCY}", _signed_money(bd["total_change"]), pct_txt)
+    r0, r1 = float(prev.get("usd_egp_rate") or 0.0), float(cur.get("usd_egp_rate") or 0.0)
+    if r0 > 0 and r1 > 0 and float(prev["total_egp"]) > 0:
+        usd0, usd1 = float(prev["total_egp"]) / r0, float(cur["total_egp"]) / r1
+        sign = "+" if usd1 >= usd0 else "−"
+        m2.metric(
+            "Change in USD terms",
+            f"{sign}${abs(usd1 - usd0):,.0f}",
+            f"{(usd1 / usd0 - 1) * 100:+.2f}%",
+            help=f"${usd0:,.0f} at {r0:,.2f} → ${usd1:,.0f} at {r1:,.2f}. Removes the effect of the pound's moves.",
+        )
+    else:
+        m2.metric("Change in USD terms", "—", help="That snapshot has no USD rate recorded.")
+    real = nwi.real_change_pct(bd["total_change_pct"] or 0.0, float(inflation or 0.0), days)
+    if real is not None:
+        m3.metric(
+            "Real change (after inflation)",
+            f"{real:+.2f}%",
+            help=f"Nominal {bd['total_change_pct'] or 0:+.2f}% minus {inflation:g}%/yr inflation over {days} days.",
+        )
+    else:
+        m3.metric("Real change (after inflation)", "—", help="Enter the annual inflation rate to see this.")
+
+    drivers = [
+        ("💱 USD rate move", bd["usd_rate"], "Revaluation of the dollars you already held, because the USD rate changed."),
+        ("💵 Change in dollars held", bd["usd_holdings"], "US stock price moves, USD added/withdrawn, USD interest — at today's rate."),
+        ("🪙 Gold price move", bd["gold_price"], "Revaluation of the gold you already held."),
+        ("📈 EGX — net money in/out", bd["egx_invested"], "Buys minus sells recorded in your transactions."),
+        ("📈 EGX — market move", bd["egx_market"], "EGX value change not explained by buying/selling."),
+        ("➕ Everything else", bd["other"], "EGP fund/CD/cash balance changes, gold bought/sold, debt changes, and any effect "
+                                          "that couldn't be split because a snapshot lacks a rate."),
+    ]
+    df = pd.DataFrame(
+        [{"Driver": n, f"Amount ({CCY})": v, "What it means": h} for n, v, h in drivers]
+        + [{"Driver": "= Total change", f"Amount ({CCY})": bd["total_change"], "What it means": ""}]
+    )
+    st.dataframe(_commas(df, {f"Amount ({CCY})": "{:+,.0f}"}), hide_index=True, use_container_width=True)
+    with st.expander("Change by asset class"):
+        cat_df = pd.DataFrame(
+            [
+                {"Asset class": r["label"], f"{picked} ({CCY})": r["prev"], f"Today ({CCY})": r["cur"],
+                 f"Change ({CCY})": r["change"]}
+                for r in bd["by_category"]
+                if r["prev"] or r["cur"]
+            ]
+        )
+        st.dataframe(
+            _commas(cat_df, {c: ("{:+,.0f}" if c.startswith("Change") else "{:,.0f}")
+                             for c in cat_df.columns if c != "Asset class"}),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
+def _nw_targets_tab(nw: dict, cfg: dict) -> None:
+    st.caption(
+        "Set a target share for each asset class (of total assets) and, optionally, for your net USD exposure. "
+        "Leave a box empty for no target. Targets are saved automatically."
+    )
+    keys = list(nwi.ALLOCATION_KEYS)
+    cols = st.columns(len(keys) + 1)
+    targets: dict[str, float] = {}
+    for col, k in zip(cols, keys):
+        v = col.number_input(
+            nwi.ALLOCATION_LABELS[k] + " %",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            format="%.1f",
+            value=_cfg_opt(cfg, f"nw_target_{k}"),
+            placeholder="—",
+            key=f"nw_tgt_{k}",
+            on_change=_save_setting,
+            args=(f"nw_tgt_{k}", f"nw_target_{k}"),
+        )
+        if v is not None:
+            targets[k] = float(v)
+    usd_target = cols[-1].number_input(
+        "🇺🇸 Net USD %",
+        min_value=0.0,
+        max_value=100.0,
+        step=1.0,
+        format="%.1f",
+        value=_cfg_opt(cfg, "nw_target_usd"),
+        placeholder="—",
+        key="nw_tgt_usd",
+        on_change=_save_setting,
+        args=("nw_tgt_usd", "nw_target_usd"),
+        help="Target share of net worth held in USD (across US stock, USD funds, cash and CDs).",
+    )
+    if not targets and usd_target is None:
+        st.info("No targets set yet.")
+        return
+    if targets and len(targets) == len(keys) and abs(sum(targets.values()) - 100.0) > 0.05:
+        st.warning(f"Your asset-class targets add up to **{sum(targets.values()):.1f}%**, not 100%.")
+
+    band = 2.0
+    rows = []
+    for r in nwi.allocation_drift(nw, targets):
+        if r["target_pct"] is None:
+            continue
+        if abs(r["drift_pct"]) < band:
+            action = "✅ On target"
+        elif r["move_egp"] > 0:
+            action = f"Add {r['move_egp']:,.0f} {CCY}"
+        else:
+            action = f"Reduce by {-r['move_egp']:,.0f} {CCY}"
+        rows.append({"Target": r["label"], "Current %": r["current_pct"], "Target %": r["target_pct"],
+                     "Drift (pts)": r["drift_pct"], "To rebalance": action})
+    if usd_target is not None:
+        gap = nwi.usd_target_gap(nw, float(usd_target))
+        if abs(gap["drift_pct"]) < band:
+            action = "✅ On target"
+        else:
+            usd_txt = f" (≈ ${abs(gap['move_usd']):,.0f})" if gap["move_usd"] is not None else ""
+            action = (f"Buy {gap['move_egp']:,.0f} {CCY} of USD{usd_txt}" if gap["move_egp"] > 0
+                      else f"Move {-gap['move_egp']:,.0f} {CCY}{usd_txt} out of USD")
+        rows.append({"Target": "🇺🇸 Net USD exposure", "Current %": gap["current_pct"], "Target %": gap["target_pct"],
+                     "Drift (pts)": gap["drift_pct"], "To rebalance": action})
+    st.dataframe(
+        pd.DataFrame(rows),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Current %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Target %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Drift (pts)": st.column_config.NumberColumn(format="%+.1f"),
+        },
+    )
+    st.caption(f"Within ±{band:g} points counts as on target. Amounts are what it would take to hit the target exactly.")
+
+
+def _nw_liquidity_tab(nw: dict, cfg: dict) -> float:
+    """Liquidity tiers + emergency-fund coverage. Returns monthly expenses (0 if unset)."""
+    tiers = nwi.liquidity_breakdown(nw)
+    seg = "".join(
+        f"<div style='width:{t['pct']:.2f}%;background:{t['color']};height:12px'></div>" for t in tiers if t["pct"] > 0
+    )
+    pills = "".join(
+        "<div style='flex:1;min-width:150px;background:#161920;border:1px solid #262a33;"
+        f"border-left:3px solid {t['color']};border-radius:8px;padding:8px 10px'>"
+        f"<div style='font-size:.8rem;color:#9aa0a6'>{_esc(t['label'])}</div>"
+        f"<div style='font-weight:700;color:#fff'>{t['pct']:.1f}% · {_esc(egx_money(t['value']))}</div>"
+        f"<div style='font-size:.73rem;color:#8a8f98'>{_esc(t['help'])}</div></div>"
+        for t in tiers
+    )
+    st.markdown(
+        "<div class='pf-card' style='padding:12px 14px'>"
+        "<div style='display:flex;width:100%;height:12px;background:#262a33;border-radius:6px;overflow:hidden;margin-bottom:10px'>"
+        f"{seg}</div><div style='display:flex;gap:10px;flex-wrap:wrap'>{pills}</div></div>",
+        unsafe_allow_html=True,
+    )
+    c1, c2, _ = st.columns([1.2, 1.4, 1.4])
+    expenses = c1.number_input(
+        f"Monthly expenses ({CCY})",
+        min_value=0.0,
+        step=1000.0,
+        format="%.0f",
+        value=_cfg_opt(cfg, "nw_monthly_expenses"),
+        placeholder="e.g. 40000",
+        key="nw_expenses",
+        on_change=_save_setting,
+        args=("nw_expenses", "nw_monthly_expenses"),
+        help="Your typical monthly spending. Used for emergency-fund months and passive-income coverage.",
+    )
+    expenses = float(expenses or 0.0)
+    months = nwi.emergency_fund_months(nw, expenses)
+    if months is None:
+        c2.metric("Emergency fund", "—", help="Enter your monthly expenses to see how many months cash + funds cover.")
+    else:
+        verdict = "🔴 below 3 months" if months < 3 else ("🟡 3–6 months" if months < 6 else "🟢 6+ months")
+        c2.metric("Emergency fund (cash + funds)", f"{months:,.1f} months", verdict, delta_color="off")
+    return expenses
+
+
+def _nw_income_tab(nw: dict, dividend_rows: list[dict], expenses: float) -> None:
+    divs_12m = nwi.trailing_dividends(dividend_rows, cairo_today())
+    inc = nwi.passive_income(nw, divs_12m, expenses)
+    c = st.columns(5)
+    c[0].metric("CD & cash interest", f"{inc['cd_monthly']:,.0f} {CCY}/mo")
+    c[1].metric("Fund yield (expected)", f"{inc['fund_monthly']:,.0f} {CCY}/mo")
+    c[2].metric("EGX dividends", f"{inc['dividend_monthly']:,.0f} {CCY}/mo", help=f"Last 12 months: {divs_12m:,.0f} {CCY}, averaged per month.")
+    c[3].metric("Debt interest", f"−{inc['interest_monthly']:,.0f} {CCY}/mo" if inc["interest_monthly"] else f"0 {CCY}/mo")
+    cov = inc["expense_coverage_pct"]
+    c[4].metric(
+        "Net passive income",
+        f"{inc['net_monthly']:,.0f} {CCY}/mo",
+        f"covers {cov:.0f}% of expenses" if cov is not None else None,
+        delta_color="off",
+        help=None if cov is not None else "Enter monthly expenses in the Liquidity tab to see coverage.",
+    )
+    st.caption(
+        "Interest uses each CD/account's stated rate on today's balance; fund yield uses the expected rate you entered. "
+        "USD income is converted at today's rate. Nominal figures — not adjusted for inflation."
+    )
+
+
+def _nw_maturities_tab(items: list, p24: float, p21: float, usd_rate: float) -> None:
+    sched = nwi.maturity_schedule(items, cairo_today(), p24, p21, usd_rate)
+    if sched:
+        rows = []
+        for r in sched:
+            d = r["days_left"]
+            status = "⛔ Past due" if d < 0 else ("⚠️ Within 30 days" if d <= nwi.MATURITY_WARN_DAYS else "")
+            rows.append({
+                "Item": ("💳 " if r["is_liability"] else "📜 ") + r["item"].name,
+                "Date": r["date"].isoformat(),
+                "Days left": d,
+                "Amount": f"{r['native']:,.2f} {r['currency']}",
+                f"Value ({CCY})": -r["value_egp"] if r["is_liability"] else r["value_egp"],
+                "Status": status,
+            })
+        st.dataframe(
+            _commas(pd.DataFrame(rows), {f"Value ({CCY})": "{:,.0f}", "Days left": "{:,.0f}"}),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("No maturity dates yet.")
+    missing = nwi.cds_without_maturity(items)
+    if missing:
+        st.caption(
+            "CDs without a maturity date: " + ", ".join(f"**{it.name}**" for it in missing)
+            + " — select one in the holdings table below → ✏️ Edit to add it."
+        )
+
+
+def _nw_concentration_tab(conc: list[dict], limit: float) -> None:
+    st.number_input(
+        "Single-holding limit (% of assets)",
+        min_value=1.0,
+        max_value=100.0,
+        step=1.0,
+        format="%.0f",
+        value=float(limit),
+        key="nw_conc_limit",
+        on_change=_save_setting,
+        args=("nw_conc_limit", "nw_concentration_limit"),
+        help="Warn when one company's stock is more than this share of your total assets.",
+    )
+    if not conc:
+        st.info("No single-company stock holdings.")
+        return
+    df = pd.DataFrame(
+        [{"Holding": h["name"], "Type": h["kind"], f"Value ({CCY})": h["value"], "% of assets": h["pct"],
+          "Status": "⚠️ Over limit" if h["pct"] > limit else ""} for h in conc]
+    )
+    st.dataframe(
+        _commas(df, {f"Value ({CCY})": "{:,.0f}"}),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "% of assets": st.column_config.ProgressColumn(format="%.1f%%", min_value=0.0, max_value=max(100.0, conc[0]["pct"])),
+        },
+    )
+    st.caption("Only single-company stocks count here — funds, gold, cash and CDs are excluded.")
+
+
 @st.fragment
 def net_worth_tab(
     positions,
@@ -2382,8 +2951,12 @@ def net_worth_tab(
     adj_txns,
     history: dict,
     price_entries: dict,
+    dividend_rows: list[dict],
 ) -> None:
     st.markdown(PORTFOLIO_CSS, unsafe_allow_html=True)
+    for k in st.session_state.pop(_NW_RESET_KEY, None) or []:
+        st.session_state.pop(k, None)
+    cfg = store.settings()  # fresh read: on_change callbacks only re-run this fragment, not the whole script
     items = [
         NetWorthItem(
             id=int(r["id"]),
@@ -2396,12 +2969,17 @@ def net_worth_tab(
             currency=str(r.get("currency") or "EGP"),
             fx_rate=float(r.get("fx_rate") if r.get("fx_rate") is not None else 1.0),
             notes=r["notes"],
+            maturity_date=str(r.get("maturity_date") or ""),
+            monthly_amount=float(r.get("monthly_amount") or 0.0),
+            updated_at=str(r.get("updated_at") or ""),
         )
         for r in nw_rows
     ]
+    today_d = cairo_today()
+    today_iso = today_d.isoformat()
 
     st.caption(
-        "Complete picture of your net worth in **EGP**, plus your exact **USD % exposure** across both cash and certificates. "
+        "Complete picture of your net worth in **EGP** (and USD), net of any debts, plus your exact **USD % exposure**. "
         "**Stocks (EGX)** and **Mutual Funds** sync automatically from your portfolio."
     )
 
@@ -2438,11 +3016,10 @@ def net_worth_tab(
         key="nw_usd_rate",
         on_change=_save_nw_setting,
         args=("nw_usd_rate", "usd_egp_rate"),
-        help="Exchange rate applied to all USD cash balances and USD Certificates of Deposit. Saved automatically.",
+        help="Exchange rate applied to all USD holdings and debts. Saved automatically.",
     )
     p24, p21 = effective_gold_prices(raw_24k, raw_21k)
     nw = compute_net_worth(positions, funds, items, p24, p21, usd_rate)
-    today_iso = cairo_today().isoformat()
 
     if g4.button("➕ Add Net Worth Item", type="primary", use_container_width=True, key="nw_add_btn"):
         net_worth_dialog(None, _new_dialog_nonce(), p24, p21, usd_rate)
@@ -2466,47 +3043,98 @@ def net_worth_tab(
             f"Active gold prices: **24K = {p24:,.2f} {CCY}/g** · **21K = {p21:,.2f} {CCY}/g** *(auto-derived by karat ratio)*"
         )
 
+    # --- Price freshness + live refresh -------------------------------------------------
+    api_key = (st.session_state.get("tab_eodhd_api_key") or os.getenv("EODHD_API_KEY", "")).strip()
+    us_items = [it for it in items if it.category == CAT_US_STOCK and it.quantity > 0]
+    fresh_bits = [f"💵 USD rate {_ago(cfg.get('usd_egp_rate_updated_at'))}"]
+    if any(it.category == CAT_GOLD for it in items):
+        fresh_bits.append(f"🪙 Gold price {_ago(cfg.get('gold_price_updated_at'))}")
+    for it in us_items:
+        fresh_bits.append(f"🌎 {it.name} ${it.unit_value:,.2f} {_ago(it.updated_at)}")
+    fr_col, btn_col = st.columns([3, 1.1], vertical_alignment="center")
+    fr_col.caption(" · ".join(fresh_bits))
+    if btn_col.button(
+        "🔄 Refresh USD & US stocks",
+        use_container_width=True,
+        disabled=not api_key,
+        key="nw_refresh_mkt",
+        help="Fetch the live USD/EGP rate and US stock prices from EODHD (1 API call each)."
+        if api_key else "Add your EODHD API key in the Prices tab (or .env) to enable this.",
+    ):
+        with st.spinner("Fetching live quotes from EODHD…"):
+            st.session_state["toast"] = _refresh_market_prices(items, api_key)
+        st.rerun()
+
+    stale = nwi.stale_inputs(cfg, items, today_d)
+    if stale:
+        st.warning(
+            "**Some values may be out of date** — update them so today's snapshot is accurate: "
+            + ", ".join(f"**{r['label']}** ({_age_text(r['age'])})" for r in stale)
+        )
+
     by_k = nw["by_key"]
-    tot = nw["total"] or 1.0
+    tot = nw["total"]
+    gross = nw["gross_assets"]
+    liab = nw["liabilities_egp"]
+    gross_denom = gross or 1.0
     equities_val = by_k["stocks"]
     cd_val = by_k["cd_cash"]
 
     # --- Top Hero Metrics -------------------------------------------------------------
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Net Worth", money(nw["total"]), f"{len(items)} manual item(s)", delta_color="off")
-    m2.metric(
+    mcols = st.columns(5 if liab > 0 else 4)
+    mcols[0].metric(
+        "Net Worth",
+        money(tot),
+        f"≈ ${tot / usd_rate:,.0f} USD" if usd_rate > 0 else f"{len(items)} manual item(s)",
+        delta_color="off",
+        help=(f"Assets {money(gross)} − Debts {money(liab)}." if liab > 0 else "Total of all assets.")
+        + (" USD figure uses today's rate." if usd_rate > 0 else ""),
+    )
+    mcols[1].metric(
         "Equities (Stocks & Funds)",
         money(equities_val),
-        f"{equities_val / tot * 100:.1f}% of net worth" if nw["total"] > 0 else None,
+        f"{equities_val / gross_denom * 100:.1f}% of assets" if gross > 0 else None,
         delta_color="off",
         help="Open EGX stocks and stock funds (such as NBE05) synced from your Portfolio tab.",
     )
     usd_delta = (
         f"{nw['usd_pct']:.1f}% of net worth · ${nw['usd_total_usd']:,.0f} USD"
-        if nw["usd_total_usd"] > 0
-        else ("0.0% of net worth" if nw["total"] > 0 else None)
+        if nw["usd_total_usd"] != 0
+        else ("0.0% of net worth" if tot > 0 else None)
     )
-    m3.metric(
-        "Total USD Exposure",
+    mcols[2].metric(
+        "Net USD Exposure" if nw.get("usd_liab_usd", 0) > 0 else "Total USD Exposure",
         money(nw["usd_total_egp"]),
         usd_delta,
         delta_color="off",
-        help="Includes liquid USD cash, USD Certificates of Deposit, and USD Mutual Funds, converted to EGP.",
+        help="USD cash, USD CDs, USD funds and US stock, converted to EGP — minus any USD debts.",
     )
     cd_delta = (
         f"+{nw['annual_cd_income'] / 12.0:,.0f} {CCY}/mo yield"
         if nw["annual_cd_income"] > 0
-        else (f"{cd_val / tot * 100:.1f}% of net worth" if nw["total"] > 0 else None)
+        else (f"{cd_val / gross_denom * 100:.1f}% of assets" if gross > 0 else None)
     )
-    m4.metric("CDs & Cash (Total)", money(cd_val), cd_delta, delta_color="off")
+    mcols[3].metric("CDs & Cash (Total)", money(cd_val), cd_delta, delta_color="off")
+    if liab > 0:
+        debt_bits = []
+        if nw["monthly_debt_payments"] > 0:
+            debt_bits.append(f"{nw['monthly_debt_payments']:,.0f}/mo installments")
+        if nw["annual_interest_cost"] > 0:
+            debt_bits.append(f"{nw['annual_interest_cost'] / 12.0:,.0f}/mo interest")
+        mcols[4].metric(
+            "Debts",
+            money(-liab),
+            " · ".join(debt_bits) or f"{liab / gross_denom * 100:.1f}% of assets",
+            delta_color="off",
+        )
 
-    # --- Donut Chart + Allocation & Currency Breakdown --------------------------------
+    # --- Allocation & Currency Breakdown ---------------------------------------------
     open_stocks = sum(1 for p in positions if p.quantity > 0 and p.symbol not in funds)
     open_stock_funds = sum(1 for p in positions if p.quantity > 0 and p.symbol in funds)
-    us_stock_items = [it for it in items if it.category == CAT_US_STOCK]
-    us_shares_total = sum(it.quantity for it in us_stock_items)
+    us_shares_total = sum(it.quantity for it in us_items)
     nw_fund_count = sum(1 for it in items if it.category == CAT_FUND)
     fx_count = sum(1 for it in items if it.category == CAT_FX)
+    debt_count = sum(1 for it in items if it.category == CAT_LIABILITY and it.quantity > 0)
     cd_parts = []
     if nw["usd_cd_usd"] > 0:
         cd_parts.append(f"incl. ${nw['usd_cd_usd']:,.0f} USD in CDs")
@@ -2521,7 +3149,7 @@ def net_worth_tab(
     meta_by_key = {
         "stocks": " + ".join(eq_parts) + " · auto-synced",
         "us_stocks": f"{us_shares_total:g} share(s) · ${nw['usd_stock_usd']:,.2f} USD"
-        if us_stock_items
+        if us_items
         else "Add PCOR / ESPP shares below",
         "funds": " · ".join(fund_parts) if fund_parts else "Add money-market / fixed-income funds below",
         "gold": f"{nw['gold_total_grams']:,.1f}g total ({nw['gold_grams_24k']:g}g 24K · {nw['gold_grams_21k']:g}g 21K)"
@@ -2529,9 +3157,38 @@ def net_worth_tab(
         else "No gold items added",
         "fx": f"${nw['usd_cash_usd']:,.0f} USD cash" if nw["usd_cash_usd"] > 0 else (f"{fx_count} currency balance(s)" if fx_count else "No FX cash added"),
         "cd_cash": " · ".join(cd_parts) if cd_parts else "EGP & FX certificates / cash",
+        "liabilities": f"{debt_count} debt(s)"
+        + (f" · {nw['annual_interest_cost'] / 12.0:,.0f} {CCY}/mo interest" if nw["annual_interest_cost"] > 0 else ""),
     }
 
     st.markdown(_nw_bars_html(nw, meta_by_key), unsafe_allow_html=True)
+
+    # --- Alerts: concentration + maturities ---------------------------------------------
+    conc_limit = _cfg_opt(cfg, "nw_concentration_limit") or nwi.CONCENTRATION_LIMIT_PCT
+    conc = nwi.holdings_concentration(positions, funds, items, nw, usd_rate)
+    over = [h for h in conc if h["pct"] > conc_limit]
+    if over:
+        msgs = []
+        for h in over:
+            m = f"**{h['name']}** is **{h['pct']:.1f}%** of your assets"
+            if h["kind"].startswith("US"):
+                m += " — and it's your employer's stock, so your salary and savings depend on the same company"
+            msgs.append(m)
+        st.warning("⚠️ Concentration (limit " + f"{conc_limit:g}%): " + "; ".join(msgs) + ".")
+    for r in nwi.maturity_schedule(items, today_d, p24, p21, usd_rate):
+        if r["is_liability"]:
+            continue
+        amount = f"{r['native']:,.0f} {r['currency']}"
+        if r["days_left"] < 0:
+            st.error(
+                f"📅 **{r['item'].name}** ({amount}) matured on **{r['date'].isoformat()}** — "
+                "renew it or move the money, then update or delete the item."
+            )
+        elif r["days_left"] <= nwi.MATURITY_WARN_DAYS:
+            st.info(
+                f"📅 **{r['item'].name}** ({amount}) matures in **{r['days_left']} day(s)** "
+                f"on {r['date'].isoformat()} — time to decide whether to renew."
+            )
 
     # --- Net Worth Over Time (Snapshots Chart) ----------------------------------------
     series = build_snapshot_series(nw_snapshots, today_iso, nw)
@@ -2539,38 +3196,38 @@ def net_worth_tab(
         components.html(nw_chart_html(series, CCY), height=NW_CHART_HEIGHT)
         st.caption(
             "Snapshots are saved automatically whenever you sync/save stock prices or update Net Worth items & rates "
-            "(one point per day — same-day edits overwrite that day's snapshot). "
-            "Use **📸 Snapshot / Backfill** above to record or backfill any historical date."
+            "(one point per day — same-day edits overwrite that day's snapshot). Each snapshot records that day's USD rate, "
+            "so you can switch the chart to **USD**. Use **📸 Snapshot / Backfill** above to record or backfill any date."
         )
         if nw_snapshots:
             with st.expander(f"🗂 Saved Snapshots ({len(nw_snapshots)}) — view or delete"):
                 snap_rows = [
                     {
                         "Date": r["date"],
-                        f"Total ({CCY})": float(r["total_egp"]),
+                        f"Net Worth ({CCY})": float(r["total_egp"]),
+                        "Net Worth ($)": (float(r["total_egp"]) / float(r["usd_egp_rate"]))
+                        if float(r.get("usd_egp_rate") or 0) > 0 else None,
+                        "USD Rate": float(r.get("usd_egp_rate") or 0) or None,
                         f"EGX Equities ({CCY})": float(r["stocks_egp"]),
                         f"US Stock ({CCY})": float(r["us_stocks_egp"]),
                         f"Mutual Funds ({CCY})": float(r["funds_egp"]),
                         f"Gold ({CCY})": float(r["gold_egp"]),
                         f"FX Cash ({CCY})": float(r["fx_egp"]),
                         f"CDs & Cash ({CCY})": float(r["cd_cash_egp"]),
+                        f"Debts ({CCY})": float(r.get("liabilities_egp") or 0.0),
                         f"USD Exposure ({CCY})": float(r.get("usd_total_egp", 0.0)),
                     }
                     for r in reversed(nw_snapshots)
                 ]
                 snap_df = pd.DataFrame(snap_rows)
                 snap_evt = st.dataframe(
-                    snap_df,
+                    _commas(snap_df, {c: ("{:,.2f}" if c == "USD Rate" else "{:,.0f}")
+                                      for c in snap_df.columns if c != "Date"}),
                     use_container_width=True,
                     hide_index=True,
                     on_select="rerun",
                     selection_mode="single-row",
                     key="nw_snap_table",
-                    column_config={
-                        col: st.column_config.NumberColumn(format="%.0f")
-                        for col in snap_df.columns
-                        if col != "Date"
-                    },
                 )
                 sel_snap = snap_evt.selection.rows
                 if sel_snap:
@@ -2587,12 +3244,31 @@ def net_worth_tab(
                 else:
                     st.caption("Select a snapshot row above to delete it, or click **📸 Snapshot / Backfill** to edit any date.")
 
-    # --- Non-Stock Holdings Table (US Stock, Mutual Funds, Gold, FX, CDs, Cash) -------
-    st.subheader("Manual Holdings (US Stock, Mutual Funds, Gold, FX, CDs & Cash)")
+    # --- What changed ------------------------------------------------------------------
+    _nw_changes_section(nw, nw_snapshots, adj_txns, today_iso, cfg)
+
+    # --- Planning & risk tools ---------------------------------------------------------
+    st.subheader("🧭 Planning & Risk")
+    t_tgt, t_liq, t_inc, t_mat, t_conc = st.tabs(
+        ["🎯 Targets & Drift", "💧 Liquidity & Emergency Fund", "💰 Passive Income", "📅 Maturities", "🧺 Concentration"]
+    )
+    with t_tgt:
+        _nw_targets_tab(nw, cfg)
+    with t_liq:
+        expenses = _nw_liquidity_tab(nw, cfg)
+    with t_inc:
+        _nw_income_tab(nw, dividend_rows, expenses)
+    with t_mat:
+        _nw_maturities_tab(items, p24, p21, usd_rate)
+    with t_conc:
+        _nw_concentration_tab(conc, conc_limit)
+
+    # --- Manual Holdings Table (US Stock, Mutual Funds, Gold, FX, CDs, Cash, Debts) -----
+    st.subheader("Manual Holdings (US Stock, Mutual Funds, Gold, FX, CDs, Cash & Debts)")
     if not items:
         st.info(
             "No manual items added yet. Click **➕ Add Net Worth Item** above "
-            "to add your PCOR/ESPP shares, mutual funds, certificates (EGP or USD/FX), currency balances, or gold."
+            "to add your PCOR/ESPP shares, mutual funds, certificates (EGP or USD/FX), currency balances, gold, or debts."
         )
         return
 
@@ -2634,6 +3310,19 @@ def net_worth_tab(
         elif it.category == CAT_FX:
             qty_str = f"{it.quantity:,.2f} {ccy}"
             rate_str = f"1 {ccy} = {eff_rate:,.2f} {CCY}"
+        elif it.category == CAT_LIABILITY:
+            qty_str = f"{it.quantity:,.2f} {ccy} owed"
+            details = []
+            if ccy != "EGP":
+                details.append(f"1 {ccy} = {eff_rate:,.2f} {CCY}")
+            if it.unit_value > 0:
+                details.append(
+                    f"{it.unit_value:g}%/yr (≈ {item_annual_interest_cost_egp(it, usd_rate) / 12.0:,.0f} {CCY}/mo interest)"
+                )
+            if it.monthly_amount > 0:
+                details.append(f"installment {it.monthly_amount * eff_rate:,.0f} {CCY}/mo")
+            rate_str = " · ".join(details) if details else "Interest-free"
+            val_egp = -val_egp
         else:
             qty_str = f"{it.quantity:,.2f} {ccy}"
             yr_native = item_annual_income_native(it)
@@ -2650,27 +3339,29 @@ def net_worth_tab(
 
         table_rows.append(
             {
-                "Type": _NW_CAT_SHORT.get(it.category, it.category) + (f" ({ccy})" if it.category in (CAT_CD, CAT_CASH, CAT_FUND) and ccy != "EGP" else ""),
+                "Type": _NW_CAT_SHORT.get(it.category, it.category)
+                + (f" ({ccy})" if it.category in (CAT_CD, CAT_CASH, CAT_FUND, CAT_LIABILITY) and ccy != "EGP" else ""),
                 "Item": it.name,
                 "Principal / Qty": qty_str,
                 "Rate / Details": rate_str,
                 f"Value ({CCY})": val_egp,
-                "Net Worth %": (val_egp / nw["total"] * 100.0) if nw["total"] > 0 else 0.0,
+                "% of Assets": (val_egp / gross * 100.0) if gross > 0 else 0.0,
+                "Matures": it.maturity_date or "—",
+                "Updated": _ago(it.updated_at).replace("updated ", ""),
                 "Notes": it.notes or "—",
             }
         )
 
     nw_df = pd.DataFrame(table_rows)
     event = st.dataframe(
-        nw_df,
+        _commas(nw_df, {f"Value ({CCY})": "{:,.2f}"}),
         use_container_width=True,
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
         key="nw_table",
         column_config={
-            f"Value ({CCY})": st.column_config.NumberColumn(format="%.2f"),
-            "Net Worth %": st.column_config.NumberColumn(format="%.1f%%"),
+            "% of Assets": st.column_config.NumberColumn(format="%.1f%%"),
         },
     )
 
@@ -2695,6 +3386,5 @@ def net_worth_tab(
 with tab_networth:
     net_worth_tab(
         positions, fund_symbols, all_nw_rows, all_nw_snapshots,
-        adj_txns, price_history, saved_price_entries,
+        adj_txns, price_history, saved_price_entries, all_dividend_rows,
     )
-

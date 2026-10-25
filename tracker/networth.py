@@ -16,7 +16,9 @@ CAT_CD = "cd"
 CAT_CASH = "cash"
 CAT_FUND = "fund"
 CAT_US_STOCK = "us_stock"
-VALID_CATEGORIES = (CAT_GOLD, CAT_FX, CAT_CD, CAT_CASH, CAT_FUND, CAT_US_STOCK)
+CAT_LIABILITY = "liability"
+ASSET_CATEGORIES = (CAT_GOLD, CAT_FX, CAT_CD, CAT_CASH, CAT_FUND, CAT_US_STOCK)
+VALID_CATEGORIES = ASSET_CATEGORIES + (CAT_LIABILITY,)
 
 # Standard Egyptian gold items: label -> (karat, weight_in_grams)
 GOLD_PRESETS: dict[str, tuple[int, float]] = {
@@ -40,15 +42,18 @@ CD_CURRENCIES = ("EGP", "USD", "EUR", "SAR", "GBP", "AED")
 @dataclass(frozen=True)
 class NetWorthItem:
     id: int
-    category: str           # 'gold', 'fx', 'cd', 'cash', 'fund', 'us_stock'
-    name: str               # e.g. 'PCOR', 'Gold Pound (8g · 21K)', 'USD', 'NBE USD CD'
-    quantity: float         # shares (us_stock), pieces (gold), units/balance (fund), amount (fx/cd/cash)
-    unit_value: float = 0.0   # $/share (us_stock), cashback/g (gold), NAV if >0 (fund), interest % (cd/cash)
+    category: str           # 'gold', 'fx', 'cd', 'cash', 'fund', 'us_stock', 'liability'
+    name: str               # e.g. 'PCOR', 'Gold Pound (8g · 21K)', 'USD', 'NBE USD CD', 'Car loan'
+    quantity: float         # shares (us_stock), pieces (gold), units/balance (fund), amount (fx/cd/cash), owed (liability)
+    unit_value: float = 0.0   # $/share (us_stock), cashback/g (gold), NAV if >0 (fund), interest % (cd/cash/liability)
     karat: int = 24         # 21 or 24 (used for gold)
     grams: float = 0.0      # weight per piece in grams (gold) or expected annual rate % (fund)
     currency: str = "EGP"   # 'EGP', 'USD', 'EUR', ...
     fx_rate: float = 1.0    # EGP per 1 unit of `currency`
     notes: str = ""
+    maturity_date: str = ""     # YYYY-MM-DD: CD maturity or liability payoff date ('' = none)
+    monthly_amount: float = 0.0  # monthly installment in native currency (liability)
+    updated_at: str = ""        # ISO timestamp of the last time this item's value was saved
 
 
 def effective_gold_prices(price_24k: float, price_21k: float) -> tuple[float, float]:
@@ -135,6 +140,13 @@ def item_annual_income_egp(item: NetWorthItem, usd_egp_rate: float = 0.0) -> flo
     return item_annual_income_native(item) * effective_fx_rate(item, usd_egp_rate)
 
 
+def item_annual_interest_cost_egp(item: NetWorthItem, usd_egp_rate: float = 0.0) -> float:
+    """Annual interest cost in EGP of a liability (outstanding balance × interest %)."""
+    if item.category != CAT_LIABILITY or item.quantity <= 0 or item.unit_value <= 0:
+        return 0.0
+    return item.quantity * (item.unit_value / 100.0) * effective_fx_rate(item, usd_egp_rate)
+
+
 def portfolio_split_egp(
     positions: Iterable[Position],
     fund_symbols: Iterable[str],
@@ -166,27 +178,39 @@ def compute_net_worth(
     price_21k: float = 0.0,
     usd_egp_rate: float = 0.0,
 ) -> dict:
-    """Aggregate Net Worth in EGP across all asset classes plus currency/USD exposure."""
+    """Aggregate Net Worth in EGP across all asset classes, liabilities, and currency/USD exposure.
+
+    ``total`` is the *net* worth (assets − liabilities). Allocation slice percentages are shares of
+    gross assets; currency exposure percentages (EGP / USD / gold / other FX) are shares of net worth,
+    with each liability offsetting the exposure of its own currency.
+    """
+    p24_eff, p21_eff = effective_gold_prices(price_24k, price_21k)
     stocks_only_val, stock_funds_val = portfolio_split_egp(positions, fund_symbols)
     equities_val = stocks_only_val + stock_funds_val
     us_stocks_val = 0.0
     mutual_funds_val = 0.0
     gold_val = 0.0
     fx_val = 0.0
-    cd_cash_val = 0.0
+    cd_val = 0.0
+    cash_val = 0.0
+    liabilities_val = 0.0
     grams_24k = 0.0
     grams_21k = 0.0
     annual_income = 0.0
     annual_fund_income = 0.0
+    annual_interest_cost = 0.0
+    monthly_debt_payments = 0.0
 
     usd_cash_usd = 0.0
     usd_cd_usd = 0.0
     usd_fund_usd = 0.0
     usd_stock_usd = 0.0
+    usd_liab_usd = 0.0
     usd_cash_egp = 0.0
     usd_cd_egp = 0.0
     usd_fund_egp = 0.0
     usd_stock_egp = 0.0
+    usd_liab_egp = 0.0
     other_fx_egp = 0.0
     egp_non_equity_egp = 0.0
     usd_fx_slice_egp = 0.0
@@ -231,7 +255,10 @@ def compute_net_worth(
             else:
                 egp_non_equity_egp += v
         elif it.category in (CAT_CD, CAT_CASH):
-            cd_cash_val += v
+            if it.category == CAT_CD:
+                cd_val += v
+            else:
+                cash_val += v
             annual_income += item_annual_income_egp(it, usd_egp_rate)
             if ccy == "USD":
                 if it.category == CAT_CD:
@@ -244,7 +271,19 @@ def compute_net_worth(
                 other_fx_egp += v
             else:
                 egp_non_equity_egp += v
+        elif it.category == CAT_LIABILITY:
+            liabilities_val += v
+            annual_interest_cost += item_annual_interest_cost_egp(it, usd_egp_rate)
+            monthly_debt_payments += max(it.monthly_amount, 0.0) * effective_fx_rate(it, usd_egp_rate)
+            if ccy == "USD":
+                usd_liab_usd += native_v
+                usd_liab_egp += v
+            elif ccy != "EGP":
+                other_fx_egp -= v
+            else:
+                egp_non_equity_egp -= v
 
+    cd_cash_val = cd_val + cash_val
     raw_slices = [
         ("stocks", "EGX Equities (Stocks & Funds)", equities_val, "#2ecc71"),
         ("us_stocks", "US / Employer Stock", us_stocks_val, "#e67e22"),
@@ -253,25 +292,33 @@ def compute_net_worth(
         ("fx", "Foreign Currency (Cash)", fx_val, "#3498db"),
         ("cd_cash", "CDs & Cash", cd_cash_val, "#1abc9c"),
     ]
-    total = sum(v for _, _, v, _ in raw_slices)
-    denom = total if total > 0 else 1.0
+    gross = sum(v for _, _, v, _ in raw_slices)
+    total = gross - liabilities_val
+    gross_denom = gross if gross > 0 else 1.0
     slices = [
         {
             "key": k,
             "label": label,
             "value": val,
-            "pct": (val / denom * 100.0) if total > 0 else 0.0,
+            "pct": (val / gross_denom * 100.0) if gross > 0 else 0.0,
             "color": color,
         }
         for k, label, val, color in raw_slices
     ]
 
-    usd_total_usd = usd_cash_usd + usd_cd_usd + usd_fund_usd + usd_stock_usd
-    usd_total_egp = usd_cash_egp + usd_cd_egp + usd_fund_egp + usd_stock_egp
+    usd_assets_usd = usd_cash_usd + usd_cd_usd + usd_fund_usd + usd_stock_usd
+    usd_assets_egp = usd_cash_egp + usd_cd_egp + usd_fund_egp + usd_stock_egp
+    usd_total_usd = usd_assets_usd - usd_liab_usd
+    usd_total_egp = usd_assets_egp - usd_liab_egp
     egp_exposure_egp = equities_val + egp_non_equity_egp
+
+    def _pct_of_net(v: float) -> float:
+        return (v / total * 100.0) if total > 0 else 0.0
 
     return {
         "total": total,
+        "gross_assets": gross,
+        "liabilities_egp": liabilities_val,
         "slices": slices,
         "by_key": {s["key"]: s["value"] for s in slices},
         # USD-denominated EGP value inside each chart slice (USD cash in the 'cash' category lives in cd_cash)
@@ -281,36 +328,50 @@ def compute_net_worth(
             "funds": usd_fund_egp,
             "gold": 0.0,
             "fx": usd_fx_slice_egp,
-            "cd_cash": usd_total_egp - usd_stock_egp - usd_fund_egp - usd_fx_slice_egp,
+            "cd_cash": usd_assets_egp - usd_stock_egp - usd_fund_egp - usd_fx_slice_egp,
+            "liabilities": usd_liab_egp,
         },
         "stocks_only_egp": stocks_only_val,
         "stock_funds_egp": stock_funds_val,
+        "cd_egp": cd_val,
+        "cash_egp": cash_val,
         "gold_grams_24k": grams_24k,
         "gold_grams_21k": grams_21k,
         "gold_total_grams": grams_24k + grams_21k,
         "annual_cd_income": annual_income,
         "annual_fund_income": annual_fund_income,
+        "annual_interest_cost": annual_interest_cost,
+        "monthly_debt_payments": monthly_debt_payments,
         "usd_cash_usd": usd_cash_usd,
         "usd_cd_usd": usd_cd_usd,
         "usd_fund_usd": usd_fund_usd,
         "usd_stock_usd": usd_stock_usd,
+        "usd_liab_usd": usd_liab_usd,
         "usd_total_usd": usd_total_usd,
         "usd_cash_egp": usd_cash_egp,
         "usd_cd_egp": usd_cd_egp,
         "usd_fund_egp": usd_fund_egp,
         "usd_stock_egp": usd_stock_egp,
+        "usd_liab_egp": usd_liab_egp,
         "usd_total_egp": usd_total_egp,
-        "usd_pct": (usd_total_egp / denom * 100.0) if total > 0 else 0.0,
+        "usd_pct": _pct_of_net(usd_total_egp),
         "other_fx_egp": other_fx_egp,
-        "other_fx_pct": (other_fx_egp / denom * 100.0) if total > 0 else 0.0,
+        "other_fx_pct": _pct_of_net(other_fx_egp),
         "egp_exposure_egp": egp_exposure_egp,
-        "egp_pct": (egp_exposure_egp / denom * 100.0) if total > 0 else 0.0,
-        "gold_pct": (gold_val / denom * 100.0) if total > 0 else 0.0,
+        "egp_pct": _pct_of_net(egp_exposure_egp),
+        "gold_pct": _pct_of_net(gold_val),
+        "usd_egp_rate": float(usd_egp_rate or 0.0),
+        "gold_24k_price": p24_eff,
+        "gold_21k_price": p21_eff,
     }
 
 
 def snapshot_from_nw(date_iso: str, nw: dict) -> dict:
-    """Convert a ``compute_net_worth`` result into a snapshot row dict keyed by ``date``."""
+    """Convert a ``compute_net_worth`` result into a snapshot row dict keyed by ``date``.
+
+    Besides the EGP values, the snapshot records the USD rate and gold price in force that day and the
+    net USD position in dollars, so history can be re-expressed in USD and changes can be attributed.
+    """
     by_k = nw["by_key"]
     return {
         "date": str(date_iso)[:10],
@@ -322,6 +383,10 @@ def snapshot_from_nw(date_iso: str, nw: dict) -> dict:
         "fx_egp": float(by_k.get("fx", 0.0)),
         "cd_cash_egp": float(by_k.get("cd_cash", 0.0)),
         "usd_total_egp": float(nw.get("usd_total_egp", 0.0)),
+        "liabilities_egp": float(nw.get("liabilities_egp", 0.0)),
+        "usd_total_usd": float(nw.get("usd_total_usd", 0.0)),
+        "usd_egp_rate": float(nw.get("usd_egp_rate", 0.0)),
+        "gold_24k_price": float(nw.get("gold_24k_price", 0.0)),
     }
 
 
@@ -329,12 +394,13 @@ SNAPSHOT_SLICE_KEYS = ("stocks", "us_stocks", "funds", "gold", "fx", "cd_cash")
 
 
 def snapshot_usd_exposure(edited: dict, base: dict, live_nw: dict) -> float:
-    """USD exposure (EGP) for a manually edited snapshot, kept consistent with its slice values.
+    """Net USD exposure (EGP) for a manually edited snapshot, kept consistent with its slice values.
 
     ``base`` is the snapshot the form was pre-filled with (saved row or live values) and ``edited``
-    holds the values being saved (``<key>_egp`` fields). Starting from ``base['usd_total_egp']``, each
-    slice's change is attributed to USD in proportion to that slice's live USD share, so editing e.g.
-    the US Stock slice moves USD exposure with it instead of leaving a stale pre-filled number.
+    holds the values being saved (``<key>_egp`` fields, plus ``liabilities_egp``). Starting from
+    ``base['usd_total_egp']``, each slice's change is attributed to USD in proportion to that slice's
+    live USD share, so editing e.g. the US Stock slice moves USD exposure with it instead of leaving a
+    stale pre-filled number. Liability changes reduce USD exposure by the live USD share of debt.
     """
     by_k = live_nw.get("by_key", {})
     usd_by_k = live_nw.get("usd_by_key", {})
@@ -344,8 +410,18 @@ def snapshot_usd_exposure(edited: dict, base: dict, live_nw: dict) -> float:
         frac = (float(usd_by_k.get(k, 0.0)) / live_v) if live_v > 0 else 0.0
         delta = float(edited.get(f"{k}_egp", 0.0)) - float(base.get(f"{k}_egp", 0.0))
         usd += delta * min(max(frac, 0.0), 1.0)
-    total = sum(float(edited.get(f"{k}_egp", 0.0)) for k in SNAPSHOT_SLICE_KEYS)
-    return round(min(max(usd, 0.0), total), 2)
+    live_liab = float(live_nw.get("liabilities_egp", 0.0))
+    liab_frac = (float(usd_by_k.get("liabilities", 0.0)) / live_liab) if live_liab > 0 else 0.0
+    liab_delta = float(edited.get("liabilities_egp", 0.0)) - float(base.get("liabilities_egp", 0.0))
+    usd -= liab_delta * min(max(liab_frac, 0.0), 1.0)
+    gross = sum(float(edited.get(f"{k}_egp", 0.0)) for k in SNAPSHOT_SLICE_KEYS)
+    return round(min(usd, gross), 2)
+
+
+_SERIES_KEYS = (
+    "total_egp", "stocks_egp", "us_stocks_egp", "funds_egp", "gold_egp", "fx_egp", "cd_cash_egp",
+    "usd_total_egp", "liabilities_egp", "usd_total_usd", "usd_egp_rate", "gold_24k_price",
+)
 
 
 def build_snapshot_series(
@@ -353,26 +429,37 @@ def build_snapshot_series(
     today_iso: str,
     live_nw: dict,
 ) -> list[dict]:
-    """Merge persisted snapshots with today's live Net Worth so the chart always ends at today."""
+    """Merge persisted snapshots with today's live Net Worth so the chart always ends at today.
+
+    Snapshots saved before the USD rate was recorded get the nearest known rate (earlier first, then
+    later) so the chart can still be shown in USD; ``rate_estimated`` flags those points.
+    """
     by_date: dict[str, dict] = {}
     for s in saved_snapshots:
         d = str(s["date"])[:10]
-        by_date[d] = {
-            "date": d,
-            "total_egp": round(float(s["total_egp"]), 2),
-            "stocks_egp": round(float(s.get("stocks_egp", 0.0)), 2),
-            "us_stocks_egp": round(float(s.get("us_stocks_egp", 0.0)), 2),
-            "funds_egp": round(float(s.get("funds_egp", 0.0)), 2),
-            "gold_egp": round(float(s.get("gold_egp", 0.0)), 2),
-            "fx_egp": round(float(s.get("fx_egp", 0.0)), 2),
-            "cd_cash_egp": round(float(s.get("cd_cash_egp", 0.0)), 2),
-            "usd_total_egp": round(float(s.get("usd_total_egp", 0.0)), 2),
-        }
+        row = {"date": d}
+        for k in _SERIES_KEYS:
+            row[k] = round(float(s.get(k) or 0.0), 4 if k == "usd_egp_rate" else 2)
+        by_date[d] = row
     today_row = snapshot_from_nw(today_iso, live_nw)
     by_date[today_row["date"]] = {
-        k: (round(v, 2) if isinstance(v, float) else v) for k, v in today_row.items()
+        k: (round(v, 4 if k == "usd_egp_rate" else 2) if isinstance(v, float) else v)
+        for k, v in today_row.items()
     }
-    return [by_date[d] for d in sorted(by_date)]
+    series = [by_date[d] for d in sorted(by_date)]
+
+    known = [(i, p["usd_egp_rate"]) for i, p in enumerate(series) if p["usd_egp_rate"] > 0]
+    for i, p in enumerate(series):
+        p["rate_estimated"] = False
+        if p["usd_egp_rate"] > 0 or not known:
+            continue
+        earlier = [r for j, r in known if j < i]
+        p["usd_egp_rate"] = earlier[-1] if earlier else known[0][1]
+        p["rate_estimated"] = True
+    for p in series:
+        if not p["usd_total_usd"] and p["usd_total_egp"] and p["usd_egp_rate"] > 0:
+            p["usd_total_usd"] = round(p["usd_total_egp"] / p["usd_egp_rate"], 2)
+    return series
 
 
 NW_CHART_HEIGHT = 490
@@ -399,6 +486,7 @@ _NW_CHART_TEMPLATE = r"""
     font:inherit;font-size:.86rem;padding:5px 11px}
   .seg button{border-radius:4px}
   .seg button.on{background:#2a2d33;color:#fff;border-color:#4a4f5c}
+  .seg button:disabled{opacity:.35;cursor:not-allowed}
   .head{display:flex;justify-content:space-between;align-items:flex-end;margin-top:10px;min-height:54px;flex-wrap:wrap;gap:12px}
   .lbl{color:#8a8f98;font-size:.82rem;margin-bottom:2px}
   .big{font-size:1.75rem;line-height:1.15;font-weight:600;color:#fff}
@@ -418,9 +506,15 @@ _NW_CHART_TEMPLATE = r"""
 <div class="card">
   <div class="top">
     <div class="title">📈 Net Worth Over Time</div>
-    <div class="seg">
-      <button id="vTotal" class="on">Total Net Worth</button>
-      <button id="vStack">Stacked Breakdown</button>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <div class="seg">
+        <button id="vTotal" class="on">Total Net Worth</button>
+        <button id="vStack">Stacked Breakdown</button>
+      </div>
+      <div class="seg">
+        <button id="cEGP" class="on">EGP</button>
+        <button id="cUSD" title="Net worth converted at each day's USD rate">USD</button>
+      </div>
     </div>
   </div>
   <div class="head">
@@ -445,14 +539,24 @@ const SLICES = [
   {k: "stocks_egp", label: "EGX Equities", color: "#2ecc71"}
 ];
 const RANGES = ["1M", "3M", "6M", "1Y", "YTD", "All"];
-let view = "total", range = __RANGE__, hover = null, pts = [];
+const HAS_USD = D.some(p => (p.usd_egp_rate || 0) > 0);
+let view = "total", range = __RANGE__, hover = null, pts = [], cur = "EGP";
+// Value of field `k` for point `p` in the selected display currency.
+function val(p, k) {
+  const v = p[k] || 0;
+  if (cur !== "USD") return v;
+  return p.usd_egp_rate > 0 ? v / p.usd_egp_rate : 0;
+}
 const H = 265, M = {l: 52, r: 10, t: 10, b: 22};
 const $ = id => document.getElementById(id);
 
 function fmtDate(t) {
   return new Date(t).toLocaleDateString("en-GB", {day: "2-digit", month: "short", year: "numeric", timeZone: "UTC"});
 }
-function money(n) { return n.toLocaleString("en-US", {minimumFractionDigits: 0, maximumFractionDigits: 0}) + " " + CCY; }
+function money(n) {
+  const s = Math.abs(n).toLocaleString("en-US", {minimumFractionDigits: 0, maximumFractionDigits: 0});
+  return (n < 0 ? "\u2212" : "") + (cur === "USD" ? "$" + s : s + " " + CCY);
+}
 function kfmt(n) {
   const a = Math.abs(n);
   return a >= 1e6 ? (n / 1e6).toFixed(2) + "M" : a >= 1e3 ? Math.round(n / 1e3) + "K" : String(Math.round(n));
@@ -501,12 +605,12 @@ function smoothPath(xy) {
 function setHeader() {
   if (!pts.length) return;
   const i = hover === null ? pts.length - 1 : hover, p = pts[i], first = pts[0];
-  const diff = p.total_egp - first.total_egp;
-  const pct = first.total_egp > 0 ? (diff / first.total_egp) * 100 : 0;
+  const diff = val(p, "total_egp") - val(first, "total_egp");
+  const pct = val(first, "total_egp") > 0 ? (diff / val(first, "total_egp")) * 100 : 0;
   const sign = diff > 0 ? "+" : diff < 0 ? "\u2212" : "";
   const cls = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
   $("lbl").textContent = "Net Worth on " + fmtDate(p.t);
-  $("big").textContent = money(p.total_egp);
+  $("big").textContent = money(val(p, "total_egp"));
   if (pts.length >= 2 && i > 0) {
     $("delta").className = "delta " + cls;
     $("delta").textContent = `${sign}${money(Math.abs(diff))} (${sign}${Math.abs(pct).toFixed(2)}%) vs ${fmtDate(first.t)}`;
@@ -514,20 +618,23 @@ function setHeader() {
     $("delta").textContent = "";
   }
   const usdPct = p.total_egp > 0 ? (p.usd_total_egp / p.total_egp * 100).toFixed(1) : "0.0";
-  $("subRight").textContent = `${pts.length} snapshot(s) · USD share: ${usdPct}%`;
+  const rateTxt = cur === "USD" && p.usd_egp_rate > 0
+    ? ` · $1 = ${p.usd_egp_rate.toFixed(2)} ${CCY}${p.rate_estimated ? " (est.)" : ""}` : "";
+  $("subRight").textContent = `${pts.length} snapshot(s) · USD share: ${usdPct}%${rateTxt}`;
 }
 function render() {
   pts = sliceRange();
   const W = $("plot").clientWidth || 700, pw = W - M.l - M.r, ph = H - M.t - M.b;
   let lo = 0, hi = 1;
+  const gross = p => SLICES.reduce((a, s) => a + Math.max(0, val(p, s.k)), 0);
   if (view === "total") {
-    lo = Math.min(...pts.map(p => p.total_egp));
-    hi = Math.max(...pts.map(p => p.total_egp));
+    lo = Math.min(...pts.map(p => val(p, "total_egp")));
+    hi = Math.max(...pts.map(p => val(p, "total_egp")));
     const pad = (hi - lo) * 0.18 || Math.abs(hi) * 0.08 || 1000;
     lo = Math.max(0, lo - pad); hi += pad;
   } else {
     lo = 0;
-    hi = Math.max(...pts.map(p => p.total_egp)) * 1.08 || 1000;
+    hi = Math.max(...pts.map(gross)) * 1.08 || 1000;
   }
   const t0 = pts[0].t, t1 = pts.length > 1 ? pts[pts.length - 1].t : t0 + 1;
   const X = t => pts.length === 1 ? M.l + pw / 2 : M.l + ((t - t0) / (t1 - t0)) * pw;
@@ -542,22 +649,22 @@ function render() {
   g += `<line x1="${M.l}" x2="${W - M.r}" y1="${H - M.b}" y2="${H - M.b}" stroke="#3a3f48"/>`;
 
   if (view === "total") {
-    const color = pts[pts.length - 1].total_egp >= pts[0].total_egp ? GREEN : RED;
+    const color = val(pts[pts.length - 1], "total_egp") >= val(pts[0], "total_egp") ? GREEN : RED;
     g += `<defs><linearGradient id="nwg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity=".28"/>` +
          `<stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>`;
     if (pts.length > 1) {
-      const xy = pts.map(p => [X(p.t), Y(p.total_egp)]), line = smoothPath(xy);
+      const xy = pts.map(p => [X(p.t), Y(val(p, "total_egp"))]), line = smoothPath(xy);
       g += `<path d="${line} L${xy[xy.length - 1][0]},${H - M.b} L${xy[0][0]},${H - M.b} Z" fill="url(#nwg)"/>` +
            `<path d="${line}" fill="none" stroke="${color}" stroke-width="2.2" stroke-linejoin="round"/>`;
     }
     for (const p of pts) {
-      g += `<circle cx="${X(p.t)}" cy="${Y(p.total_egp)}" r="4" fill="${color}" stroke="#1c1f26" stroke-width="1.5"/>`;
+      g += `<circle cx="${X(p.t)}" cy="${Y(val(p, "total_egp"))}" r="4" fill="${color}" stroke="#1c1f26" stroke-width="1.5"/>`;
     }
   } else {
     const cum = pts.map(() => 0);
     for (const s of SLICES) {
       const prev = [...cum];
-      for (let i = 0; i < pts.length; i++) cum[i] += Math.max(0, pts[i][s.k] || 0);
+      for (let i = 0; i < pts.length; i++) cum[i] += Math.max(0, val(pts[i], s.k));
       if (pts.length > 1) {
         const topPts = pts.map((p, i) => `${X(p.t)},${Y(cum[i])}`).join(" L");
         const botPts = pts.map((p, i) => `${X(p.t)},${Y(prev[i])}`).reverse().join(" L");
@@ -566,6 +673,11 @@ function render() {
         const x = X(pts[0].t);
         g += `<line x1="${x - 30}" x2="${x + 30}" y1="${Y(cum[0])}" y2="${Y(cum[0])}" stroke="${s.color}" stroke-width="4"/>`;
       }
+    }
+    // With debts, the stack shows gross assets; overlay net worth as a dashed line.
+    if (pts.some(p => (p.liabilities_egp || 0) > 0) && pts.length > 1) {
+      const net = pts.map(p => `${X(p.t)},${Y(Math.max(0, val(p, "total_egp")))}`).join(" L");
+      g += `<path d="M${net}" fill="none" stroke="#fff" stroke-width="1.8" stroke-dasharray="5 4"/>`;
     }
   }
 
@@ -581,20 +693,24 @@ function render() {
     const r = svg.getBoundingClientRect(), cx = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
     let best = 0;
     for (let i = 1; i < pts.length; i++) if (Math.abs(X(pts[i].t) - cx) < Math.abs(X(pts[best].t) - cx)) best = i;
-    if (best !== hover) { hover = best; render(); showTip(X(pts[best].t), Y(pts[best].total_egp)); }
+    if (best !== hover) { hover = best; render(); showTip(X(pts[best].t), Y(tipY(pts[best]))); }
   };
   hit.onmousemove = move; hit.ontouchmove = move;
   hit.onmouseleave = hit.ontouchend = () => { hover = null; $("tip").style.display = "none"; render(); };
   setHeader();
-  if (hover !== null && pts[hover]) showTip(X(pts[hover].t), Y(pts[hover].total_egp));
+  if (hover !== null && pts[hover]) showTip(X(pts[hover].t), Y(tipY(pts[hover])));
 }
+function tipY(p) { return view === "total" ? val(p, "total_egp") : SLICES.reduce((a, s) => a + Math.max(0, val(p, s.k)), 0); }
 function showTip(x, y) {
   const p = pts[hover], tip = $("tip");
   const row = (l, v, c) => `<div class="row"><span style="color:${c || '#9aa0a6'}">${l}</span><b>${money(v)}</b></div>`;
-  let html = `<div class="t">${fmtDate(p.t)}</div>` + row("Total Net Worth", p.total_egp, "#fff");
+  let html = `<div class="t">${fmtDate(p.t)}</div>` + row("Net Worth", val(p, "total_egp"), "#fff");
   for (const s of [...SLICES].reverse()) {
-    if ((p[s.k] || 0) > 0) html += row(s.label, p[s.k], s.color);
+    if ((p[s.k] || 0) > 0) html += row(s.label, val(p, s.k), s.color);
   }
+  if ((p.liabilities_egp || 0) > 0) html += row("Debts", -val(p, "liabilities_egp"), RED);
+  if (cur === "USD" && p.usd_egp_rate > 0)
+    html += `<div class="row" style="margin-top:4px"><span>USD rate</span><b>${p.usd_egp_rate.toFixed(2)}${p.rate_estimated ? " (est.)" : ""}</b></div>`;
   tip.innerHTML = html;
   tip.style.display = "block";
   const w = tip.offsetWidth, plotW = $("plot").clientWidth;
@@ -603,6 +719,14 @@ function showTip(x, y) {
 }
 $("vTotal").onclick = () => { view = "total"; hover = null; $("vTotal").classList.add("on"); $("vStack").classList.remove("on"); render(); };
 $("vStack").onclick = () => { view = "stack"; hover = null; $("vStack").classList.add("on"); $("vTotal").classList.remove("on"); render(); };
+function setCur(c) {
+  cur = c; hover = null;
+  $("cEGP").classList.toggle("on", c === "EGP"); $("cUSD").classList.toggle("on", c === "USD");
+  render();
+}
+$("cEGP").onclick = () => setCur("EGP");
+$("cUSD").onclick = () => setCur("USD");
+if (!HAS_USD) { $("cUSD").disabled = true; $("cUSD").title = "Set a USD rate to see net worth in USD"; }
 RANGES.forEach(r => {
   const b = document.createElement("button"); b.textContent = r; b.dataset.r = r;
   b.onclick = () => { range = r; hover = null; document.querySelectorAll("#pills button")

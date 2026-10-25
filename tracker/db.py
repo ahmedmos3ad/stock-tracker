@@ -4,13 +4,44 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from .networth import NetWorthItem
 from .portfolio import Dividend, Transaction
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "portfolio.db"
+
+_NW_ITEMS_DDL = """
+CREATE TABLE {name} (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    category       TEXT    NOT NULL CHECK (category IN ('gold', 'fx', 'cd', 'cash', 'fund', 'us_stock', 'liability')),
+    name           TEXT    NOT NULL,
+    quantity       REAL    NOT NULL CHECK (quantity >= 0),
+    unit_value     REAL    NOT NULL DEFAULT 0 CHECK (unit_value >= 0),
+    karat          INTEGER NOT NULL DEFAULT 24 CHECK (karat IN (21, 24)),
+    grams          REAL    NOT NULL DEFAULT 0 CHECK (grams >= 0),
+    currency       TEXT    NOT NULL DEFAULT 'EGP',
+    fx_rate        REAL    NOT NULL DEFAULT 1.0 CHECK (fx_rate >= 0),
+    notes          TEXT    NOT NULL DEFAULT '',
+    maturity_date  TEXT    NOT NULL DEFAULT '',
+    monthly_amount REAL    NOT NULL DEFAULT 0 CHECK (monthly_amount >= 0),
+    updated_at     TEXT    NOT NULL DEFAULT ''
+)
+"""
+_NW_ITEM_COLS = (
+    "id, category, name, quantity, unit_value, karat, grams, currency, fx_rate, notes, "
+    "maturity_date, monthly_amount, updated_at"
+)
+# Extra snapshot columns added after the first release (all REAL, default 0 = unknown).
+_SNAPSHOT_EXTRA_COLS = ("liabilities_egp", "usd_total_usd", "usd_egp_rate", "gold_24k_price")
+
+
+def now_iso() -> str:
+    """Current Cairo time as an ISO timestamp (seconds precision)."""
+    return datetime.now(ZoneInfo("Africa/Cairo")).isoformat(timespec="seconds")
 
 
 def _as_int_quantity(value: float | int) -> int:
@@ -86,19 +117,6 @@ class Store:
                 value TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS net_worth_items (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                category   TEXT    NOT NULL CHECK (category IN ('gold', 'fx', 'cd', 'cash', 'fund', 'us_stock')),
-                name       TEXT    NOT NULL,
-                quantity   REAL    NOT NULL CHECK (quantity >= 0),
-                unit_value REAL    NOT NULL DEFAULT 0 CHECK (unit_value >= 0),
-                karat      INTEGER NOT NULL DEFAULT 24 CHECK (karat IN (21, 24)),
-                grams      REAL    NOT NULL DEFAULT 0 CHECK (grams >= 0),
-                currency   TEXT    NOT NULL DEFAULT 'EGP',
-                fx_rate    REAL    NOT NULL DEFAULT 1.0 CHECK (fx_rate >= 0),
-                notes      TEXT    NOT NULL DEFAULT ''
-            );
-
             CREATE TABLE IF NOT EXISTS net_worth_snapshots (
                 date          TEXT PRIMARY KEY,
                 total_egp     REAL NOT NULL,
@@ -112,36 +130,39 @@ class Store:
             );
             """
             )
+            has_items = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='net_worth_items'"
+            ).fetchone()
+            if not has_items:
+                self._conn.execute(_NW_ITEMS_DDL.format(name="net_worth_items"))
             nw_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(net_worth_items)")}
             if "currency" not in nw_cols:
                 self._conn.execute("ALTER TABLE net_worth_items ADD COLUMN currency TEXT NOT NULL DEFAULT 'EGP'")
             if "fx_rate" not in nw_cols:
                 self._conn.execute("ALTER TABLE net_worth_items ADD COLUMN fx_rate REAL NOT NULL DEFAULT 1.0")
+            if "maturity_date" not in nw_cols:
+                self._conn.execute("ALTER TABLE net_worth_items ADD COLUMN maturity_date TEXT NOT NULL DEFAULT ''")
+            if "monthly_amount" not in nw_cols:
+                self._conn.execute("ALTER TABLE net_worth_items ADD COLUMN monthly_amount REAL NOT NULL DEFAULT 0")
+            if "updated_at" not in nw_cols:
+                self._conn.execute("ALTER TABLE net_worth_items ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+                # Existing items start their freshness clock now (their real last-edit time is unknown).
+                self._conn.execute("UPDATE net_worth_items SET updated_at = ?", (now_iso(),))
             nw_sql = self._conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='net_worth_items'"
             ).fetchone()
-            if nw_sql and "'us_stock'" not in nw_sql[0]:
-                self._conn.executescript(
-                    """
-                    ALTER TABLE net_worth_items RENAME TO _net_worth_items_old;
-                    CREATE TABLE net_worth_items (
-                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                        category   TEXT    NOT NULL CHECK (category IN ('gold', 'fx', 'cd', 'cash', 'fund', 'us_stock')),
-                        name       TEXT    NOT NULL,
-                        quantity   REAL    NOT NULL CHECK (quantity >= 0),
-                        unit_value REAL    NOT NULL DEFAULT 0 CHECK (unit_value >= 0),
-                        karat      INTEGER NOT NULL DEFAULT 24 CHECK (karat IN (21, 24)),
-                        grams      REAL    NOT NULL DEFAULT 0 CHECK (grams >= 0),
-                        currency   TEXT    NOT NULL DEFAULT 'EGP',
-                        fx_rate    REAL    NOT NULL DEFAULT 1.0 CHECK (fx_rate >= 0),
-                        notes      TEXT    NOT NULL DEFAULT ''
-                    );
-                    INSERT INTO net_worth_items (id, category, name, quantity, unit_value, karat, grams, currency, fx_rate, notes)
-                    SELECT id, category, name, quantity, unit_value, karat, grams, currency, fx_rate, notes
-                    FROM _net_worth_items_old;
-                    DROP TABLE _net_worth_items_old;
-                    """
+            if nw_sql and "'liability'" not in nw_sql[0]:
+                # Rebuild to widen the category CHECK constraint (SQLite cannot ALTER a CHECK).
+                self._conn.execute("ALTER TABLE net_worth_items RENAME TO _net_worth_items_old")
+                self._conn.execute(_NW_ITEMS_DDL.format(name="net_worth_items"))
+                self._conn.execute(
+                    f"INSERT INTO net_worth_items ({_NW_ITEM_COLS}) SELECT {_NW_ITEM_COLS} FROM _net_worth_items_old"
                 )
+                self._conn.execute("DROP TABLE _net_worth_items_old")
+            snap_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(net_worth_snapshots)")}
+            for col in _SNAPSHOT_EXTRA_COLS:
+                if col not in snap_cols:
+                    self._conn.execute(f"ALTER TABLE net_worth_snapshots ADD COLUMN {col} REAL NOT NULL DEFAULT 0")
             # An older version of the app kept a differently-shaped `price_history` table.
             # Copy its rows into daily_closes (never modifying or dropping the old table).
             legacy_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(price_history)")}
@@ -336,12 +357,16 @@ class Store:
         notes: str = "",
         currency: str = "EGP",
         fx_rate: float = 1.0,
+        maturity_date: str = "",
+        monthly_amount: float = 0.0,
+        updated_at: Optional[str] = None,
     ) -> int:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO net_worth_items "
-                "(category, name, quantity, unit_value, karat, grams, currency, fx_rate, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(category, name, quantity, unit_value, karat, grams, currency, fx_rate, notes, "
+                "maturity_date, monthly_amount, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     category.strip().lower(),
                     name.strip(),
@@ -352,6 +377,9 @@ class Store:
                     currency.strip().upper() or "EGP",
                     float(fx_rate),
                     notes.strip(),
+                    (maturity_date or "").strip()[:10],
+                    float(monthly_amount or 0.0),
+                    updated_at or now_iso(),
                 ),
             )
             self._conn.commit()
@@ -369,11 +397,15 @@ class Store:
         notes: str = "",
         currency: str = "EGP",
         fx_rate: float = 1.0,
+        maturity_date: str = "",
+        monthly_amount: float = 0.0,
+        updated_at: Optional[str] = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE net_worth_items SET category = ?, name = ?, quantity = ?, unit_value = ?, "
-                "karat = ?, grams = ?, currency = ?, fx_rate = ?, notes = ? WHERE id = ?",
+                "karat = ?, grams = ?, currency = ?, fx_rate = ?, notes = ?, "
+                "maturity_date = ?, monthly_amount = ?, updated_at = ? WHERE id = ?",
                 (
                     category.strip().lower(),
                     name.strip(),
@@ -384,8 +416,20 @@ class Store:
                     currency.strip().upper() or "EGP",
                     float(fx_rate),
                     notes.strip(),
+                    (maturity_date or "").strip()[:10],
+                    float(monthly_amount or 0.0),
+                    updated_at or now_iso(),
                     int(item_id),
                 ),
+            )
+            self._conn.commit()
+
+    def set_net_worth_item_price(self, item_id: int, unit_value: float, updated_at: Optional[str] = None) -> None:
+        """Update only the per-unit price of an item (e.g. a US stock's $/share from a market feed)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE net_worth_items SET unit_value = ?, updated_at = ? WHERE id = ?",
+                (float(unit_value), updated_at or now_iso(), int(item_id)),
             )
             self._conn.commit()
 
@@ -414,41 +458,30 @@ class Store:
                 currency=str(r.get("currency") or "EGP"),
                 fx_rate=float(r.get("fx_rate") if r.get("fx_rate") is not None else 1.0),
                 notes=r["notes"],
+                maturity_date=str(r.get("maturity_date") or ""),
+                monthly_amount=float(r.get("monthly_amount") or 0.0),
+                updated_at=str(r.get("updated_at") or ""),
             )
             for r in self.list_net_worth_items()
         ]
 
     # --- net worth historical snapshots --------------------------------------------
+    _SNAPSHOT_COLS = (
+        "total_egp", "stocks_egp", "us_stocks_egp", "funds_egp", "gold_egp", "fx_egp", "cd_cash_egp",
+        "usd_total_egp",
+    ) + _SNAPSHOT_EXTRA_COLS
+
     def upsert_net_worth_snapshot(self, snap: dict) -> None:
         """Insert or overwrite a daily net worth snapshot keyed by YYYY-MM-DD."""
+        cols = self._SNAPSHOT_COLS
+        sql = (
+            f"INSERT INTO net_worth_snapshots (date, {', '.join(cols)}) "
+            f"VALUES ({', '.join('?' for _ in range(len(cols) + 1))}) "
+            f"ON CONFLICT(date) DO UPDATE SET {', '.join(f'{c} = excluded.{c}' for c in cols)}"
+        )
+        values = [str(snap["date"])[:10]] + [float(snap.get(c) or 0.0) for c in cols]
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO net_worth_snapshots
-                    (date, total_egp, stocks_egp, us_stocks_egp, funds_egp, gold_egp, fx_egp, cd_cash_egp, usd_total_egp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(date) DO UPDATE SET
-                    total_egp     = excluded.total_egp,
-                    stocks_egp    = excluded.stocks_egp,
-                    us_stocks_egp = excluded.us_stocks_egp,
-                    funds_egp     = excluded.funds_egp,
-                    gold_egp      = excluded.gold_egp,
-                    fx_egp        = excluded.fx_egp,
-                    cd_cash_egp   = excluded.cd_cash_egp,
-                    usd_total_egp = excluded.usd_total_egp
-                """,
-                (
-                    str(snap["date"])[:10],
-                    float(snap.get("total_egp", 0.0)),
-                    float(snap.get("stocks_egp", 0.0)),
-                    float(snap.get("us_stocks_egp", 0.0)),
-                    float(snap.get("funds_egp", 0.0)),
-                    float(snap.get("gold_egp", 0.0)),
-                    float(snap.get("fx_egp", 0.0)),
-                    float(snap.get("cd_cash_egp", 0.0)),
-                    float(snap.get("usd_total_egp", 0.0)),
-                ),
-            )
+            self._conn.execute(sql, values)
             self._conn.commit()
 
     def delete_net_worth_snapshot(self, date_iso: str) -> None:

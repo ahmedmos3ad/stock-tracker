@@ -263,6 +263,16 @@ class AppStructureTests(unittest.TestCase):
                 owner = next((nm for nm, f in self.funcs.items() if n in ast.walk(f)), None)
                 self.assertIn(owner, {"_fetch_close", "_fetch_hist"}, f"unguarded call to {n.func.id}")
 
+    def test_market_quotes_only_fetched_by_the_net_worth_refresh(self):
+        import ast
+
+        owners = set()
+        for name, fn in self.funcs.items():
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "fetch_realtime_price":
+                    owners.add(name)
+        self.assertEqual(owners, {"_refresh_market_prices"})
+
 
 class FundFeeTests(unittest.TestCase):
     def test_fund_trades_default_to_zero_fee(self):
@@ -542,6 +552,219 @@ class NetWorthTests(unittest.TestCase):
 
         s.delete_net_worth_snapshot("2026-09-30")
         self.assertEqual(s.list_net_worth_snapshots(), [])
+
+
+class NetWorthManagementTests(unittest.TestCase):
+    """Liabilities, snapshot rates, and the nw_insights helpers."""
+
+    def _items(self):
+        from tracker.networth import (
+            CAT_CASH, CAT_CD, CAT_FUND, CAT_FX, CAT_GOLD, CAT_LIABILITY, CAT_US_STOCK, NetWorthItem,
+        )
+
+        return [
+            NetWorthItem(1, CAT_US_STOCK, "PCOR", quantity=100.0, unit_value=50.0, currency="USD", fx_rate=50.0,
+                         updated_at="2026-10-01T10:00:00+03:00"),
+            NetWorthItem(2, CAT_US_STOCK, "PCOR (ESPP)", quantity=20.0, unit_value=50.0, currency="USD", fx_rate=50.0,
+                         updated_at="2026-10-24T10:00:00+03:00"),
+            NetWorthItem(3, CAT_CD, "USD CD", quantity=1000.0, unit_value=5.0, currency="USD", fx_rate=50.0,
+                         maturity_date="2026-11-10"),
+            NetWorthItem(4, CAT_CD, "EGP CD", quantity=100000.0, unit_value=20.0, maturity_date="2027-06-01"),
+            NetWorthItem(5, CAT_CASH, "Savings", quantity=50000.0),
+            NetWorthItem(6, CAT_FX, "USD", quantity=200.0, currency="USD", fx_rate=50.0),
+            NetWorthItem(7, CAT_FUND, "MMF", quantity=40000.0, grams=18.0, updated_at="2026-10-20"),
+            NetWorthItem(8, CAT_GOLD, "10g Bar (24K)", quantity=1.0, karat=24, grams=10.0),
+            NetWorthItem(9, CAT_LIABILITY, "Car loan", quantity=60000.0, unit_value=20.0, monthly_amount=5000.0,
+                         maturity_date="2027-12-01", updated_at="2026-10-25"),
+            NetWorthItem(10, CAT_LIABILITY, "USD card", quantity=100.0, currency="USD", fx_rate=50.0,
+                         updated_at="2026-10-25"),
+        ]
+
+    def _nw(self):
+        from tracker.networth import compute_net_worth
+
+        positions = compute_positions(
+            [T("ABUK", BUY, 1000, 100.0, "2026-01-01"), T("NBE05", BUY, 100, 100.0, "2026-01-01")],
+            (), {"ABUK": 150.0, "NBE05": 100.0},
+        )
+        return positions, compute_net_worth(positions, ["NBE05"], self._items(), 5000.0, 0.0, 50.0)
+
+    def test_liabilities_are_netted_and_offset_their_currency(self):
+        _, nw = self._nw()
+        # Assets: EGX 150k+10k, PCOR 120sh*$50*50=300k, USD CD 50k, EGP CD 100k, cash 50k, FX 10k,
+        #         MMF 40k, gold 10g*5000=50k  -> 760k gross.  Debts: 60k EGP + $100 (5k) = 65k.
+        self.assertAlmostEqual(nw["gross_assets"], 760000.0)
+        self.assertAlmostEqual(nw["liabilities_egp"], 65000.0)
+        self.assertAlmostEqual(nw["total"], 695000.0)
+        self.assertAlmostEqual(sum(s["pct"] for s in nw["slices"]), 100.0)  # shares of gross assets
+        self.assertAlmostEqual(nw["usd_total_usd"], 6000.0 + 1000.0 + 200.0 - 100.0)
+        self.assertAlmostEqual(nw["usd_total_egp"], 7100.0 * 50.0)
+        # exposure buckets are shares of NET worth and must add up to 100%
+        self.assertAlmostEqual(nw["egp_pct"] + nw["usd_pct"] + nw["gold_pct"] + nw["other_fx_pct"], 100.0)
+        self.assertAlmostEqual(nw["annual_interest_cost"], 60000.0 * 0.20)
+        self.assertAlmostEqual(nw["monthly_debt_payments"], 5000.0)
+        self.assertAlmostEqual(nw["cd_egp"], 150000.0)
+        self.assertAlmostEqual(nw["cash_egp"], 50000.0)
+        self.assertAlmostEqual(nw["usd_egp_rate"], 50.0)
+        self.assertAlmostEqual(nw["gold_24k_price"], 5000.0)
+
+    def test_snapshot_records_rates_and_series_fills_missing_rate(self):
+        from tracker.networth import build_snapshot_series, snapshot_from_nw
+
+        _, nw = self._nw()
+        snap = snapshot_from_nw("2026-10-25", nw)
+        self.assertAlmostEqual(snap["usd_egp_rate"], 50.0)
+        self.assertAlmostEqual(snap["liabilities_egp"], 65000.0)
+        self.assertAlmostEqual(snap["usd_total_usd"], 7100.0)
+        old = {"date": "2026-09-01", "total_egp": 500000.0, "usd_total_egp": 240000.0}  # pre-upgrade row
+        series = build_snapshot_series([old], "2026-10-25", nw)
+        self.assertTrue(series[0]["rate_estimated"])
+        self.assertAlmostEqual(series[0]["usd_egp_rate"], 50.0)  # nearest known rate
+        self.assertAlmostEqual(series[0]["usd_total_usd"], 4800.0)
+        self.assertFalse(series[1]["rate_estimated"])
+
+    def test_store_migrates_old_schema_and_roundtrips_new_fields(self):
+        import sqlite3
+        import tempfile
+        from tracker.db import Store
+
+        path = Path(tempfile.mkdtemp()) / "old.db"
+        with sqlite3.connect(path) as c:
+            c.executescript(
+                """
+                CREATE TABLE net_worth_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT NOT NULL CHECK (category IN ('gold','fx','cd','cash','fund','us_stock')),
+                    name TEXT NOT NULL, quantity REAL NOT NULL, unit_value REAL NOT NULL DEFAULT 0,
+                    karat INTEGER NOT NULL DEFAULT 24, grams REAL NOT NULL DEFAULT 0,
+                    currency TEXT NOT NULL DEFAULT 'EGP', fx_rate REAL NOT NULL DEFAULT 1.0,
+                    notes TEXT NOT NULL DEFAULT '');
+                INSERT INTO net_worth_items (category, name, quantity, unit_value) VALUES ('cd', 'Old CD', 1000, 20);
+                CREATE TABLE net_worth_snapshots (date TEXT PRIMARY KEY, total_egp REAL NOT NULL,
+                    stocks_egp REAL NOT NULL DEFAULT 0, us_stocks_egp REAL NOT NULL DEFAULT 0,
+                    funds_egp REAL NOT NULL DEFAULT 0, gold_egp REAL NOT NULL DEFAULT 0,
+                    fx_egp REAL NOT NULL DEFAULT 0, cd_cash_egp REAL NOT NULL DEFAULT 0,
+                    usd_total_egp REAL NOT NULL DEFAULT 0);
+                INSERT INTO net_worth_snapshots (date, total_egp) VALUES ('2026-10-01', 1000);
+                """
+            )
+        s = Store(path)
+        (old,) = s.net_worth_items()
+        self.assertEqual((old.name, old.quantity, old.maturity_date), ("Old CD", 1000.0, ""))
+        self.assertTrue(old.updated_at)  # freshness clock started at migration
+        lid = s.add_net_worth_item("liability", "Loan", 5000.0, 18.0, maturity_date="2027-01-31",
+                                   monthly_amount=500.0, updated_at="2026-10-25T09:00:00+03:00")
+        loan = {it.id: it for it in s.net_worth_items()}[lid]
+        self.assertEqual(loan.maturity_date, "2027-01-31")
+        self.assertAlmostEqual(loan.monthly_amount, 500.0)
+        s.set_net_worth_item_price(lid, 19.0, "2026-10-26T09:00:00+03:00")
+        loan = {it.id: it for it in s.net_worth_items()}[lid]
+        self.assertEqual((loan.unit_value, loan.updated_at), (19.0, "2026-10-26T09:00:00+03:00"))
+        self.assertEqual(s.list_net_worth_snapshots()[0]["usd_egp_rate"], 0.0)
+        s.upsert_net_worth_snapshot({"date": "2026-10-01", "total_egp": 900.0, "liabilities_egp": 100.0,
+                                     "usd_egp_rate": 48.5, "usd_total_usd": 3.0, "gold_24k_price": 4000.0})
+        row = s.list_net_worth_snapshots()[0]
+        self.assertEqual((row["total_egp"], row["liabilities_egp"], row["usd_egp_rate"]), (900.0, 100.0, 48.5))
+        Store(path)  # re-opening an upgraded DB is a no-op
+
+    def test_stale_inputs(self):
+        from datetime import date
+        from tracker.nw_insights import stale_inputs
+
+        settings = {"usd_egp_rate_updated_at": "2026-10-24T10:00:00+03:00"}  # gold price never stamped
+        out = {r["label"]: r["age"] for r in stale_inputs(settings, self._items(), date(2026, 10, 25))}
+        self.assertEqual(out, {"Gold price": None, "PCOR share price": 24, "Savings balance": None})
+
+    def test_maturities_liquidity_and_emergency_fund(self):
+        from datetime import date
+        from tracker.nw_insights import (
+            cds_without_maturity, emergency_fund_months, liquidity_breakdown, maturity_schedule,
+        )
+
+        _, nw = self._nw()
+        sched = maturity_schedule(self._items(), date(2026, 10, 25), 5000.0, 0.0, 50.0)
+        self.assertEqual([(r["item"].name, r["days_left"]) for r in sched],
+                         [("USD CD", 16), ("EGP CD", 219), ("Car loan", 402)])
+        self.assertAlmostEqual(sched[0]["value_egp"], 50000.0)
+        self.assertEqual(cds_without_maturity(self._items()), [])
+        tiers = {t["key"]: t["value"] for t in liquidity_breakdown(nw)}
+        self.assertEqual(tiers, {"cash": 60000.0, "funds": 40000.0, "market": 510000.0, "locked": 150000.0})
+        self.assertAlmostEqual(emergency_fund_months(nw, 20000.0), 5.0)
+        self.assertIsNone(emergency_fund_months(nw, 0.0))
+
+    def test_passive_income_and_trailing_dividends(self):
+        from datetime import date
+        from tracker.nw_insights import passive_income, trailing_dividends
+
+        _, nw = self._nw()
+        divs = [{"amount": 1200.0, "date": "2026-05-01"}, {"amount": 999.0, "date": "2025-01-01"}]
+        d12 = trailing_dividends(divs, date(2026, 10, 25))
+        self.assertAlmostEqual(d12, 1200.0)
+        inc = passive_income(nw, d12, monthly_expenses=10000.0)
+        # CDs: $1000*5%*50 + 100000*20% = 22,500/yr; fund 40000*18% = 7,200/yr; debt interest 12,000/yr
+        self.assertAlmostEqual(inc["cd_monthly"], 22500.0 / 12)
+        self.assertAlmostEqual(inc["fund_monthly"], 600.0)
+        self.assertAlmostEqual(inc["dividend_monthly"], 100.0)
+        self.assertAlmostEqual(inc["interest_monthly"], 1000.0)
+        self.assertAlmostEqual(inc["net_monthly"], 22500.0 / 12 + 600.0 + 100.0 - 1000.0)
+        self.assertAlmostEqual(inc["expense_coverage_pct"], inc["net_monthly"] / 100.0)
+
+    def test_concentration_groups_tickers_and_skips_funds(self):
+        from tracker.nw_insights import holdings_concentration, us_ticker
+
+        self.assertEqual(us_ticker("PCOR (ESPP)"), "PCOR")
+        positions, nw = self._nw()
+        rows = holdings_concentration(positions, ["NBE05"], self._items(), nw, 50.0)
+        self.assertEqual([r["name"] for r in rows], ["PCOR", "ABUK"])  # NBE05 is a fund -> excluded
+        self.assertAlmostEqual(rows[0]["value"], 300000.0)
+        self.assertAlmostEqual(rows[0]["pct"], 300000.0 / 760000.0 * 100.0)
+
+    def test_allocation_drift_and_usd_gap(self):
+        from tracker.nw_insights import allocation_drift, usd_target_gap
+
+        _, nw = self._nw()
+        rows = {r["key"]: r for r in allocation_drift(nw, {"gold": 10.0})}
+        self.assertIsNone(rows["stocks"]["target_pct"])
+        self.assertAlmostEqual(rows["gold"]["move_egp"], 76000.0 - 50000.0)
+        gap = usd_target_gap(nw, 60.0)
+        self.assertAlmostEqual(gap["move_egp"], 0.6 * 695000.0 - 355000.0)
+        self.assertAlmostEqual(gap["move_usd"], gap["move_egp"] / 50.0)
+
+    def test_change_breakdown_adds_up(self):
+        from tracker.nw_insights import change_breakdown, egx_net_invested, real_change_pct
+
+        txns = [T("ABUK", BUY, 100, 10.0, "2026-10-05", fee=1.0), T("ABUK", SELL, 50, 12.0, "2026-10-06", fee=1.0),
+                T("ABUK", BUY, 1, 1.0, "2026-09-01")]
+        invested = egx_net_invested(txns, "2026-10-01", "2026-10-25")
+        self.assertAlmostEqual(invested, 1001.0 - 599.0)
+        prev = {"total_egp": 1000000.0, "stocks_egp": 200000.0, "gold_egp": 100000.0, "usd_total_egp": 500000.0,
+                "usd_egp_rate": 50.0, "gold_24k_price": 5000.0}
+        cur = {"total_egp": 1100000.0, "stocks_egp": 210000.0, "gold_egp": 110000.0, "usd_total_egp": 561000.0,
+               "usd_total_usd": 11000.0, "usd_egp_rate": 51.0, "gold_24k_price": 5500.0}
+        bd = change_breakdown(prev, cur, invested)
+        self.assertAlmostEqual(bd["usd_rate"], 10000.0 * 1.0)
+        self.assertAlmostEqual(bd["usd_holdings"], 1000.0 * 51.0)
+        self.assertAlmostEqual(bd["gold_price"], 10000.0)
+        self.assertAlmostEqual(bd["egx_market"], 10000.0 - invested)
+        parts = bd["usd_rate"] + bd["usd_holdings"] + bd["gold_price"] + bd["egx_invested"] + bd["egx_market"] + bd["other"]
+        self.assertAlmostEqual(parts, bd["total_change"])
+        self.assertAlmostEqual(bd["total_change_pct"], 10.0)
+        # without rates the split is unavailable and everything lands in "other"
+        bd2 = change_breakdown({"total_egp": 100.0}, {"total_egp": 110.0})
+        self.assertIsNone(bd2["usd_rate"])
+        self.assertAlmostEqual(bd2["other"], 10.0)
+        self.assertAlmostEqual(real_change_pct(10.0, 10.0, 365), 0.0)
+        self.assertIsNone(real_change_pct(10.0, 0.0, 365))
+
+    def test_market_helpers(self):
+        from tracker.market import parse_realtime_price, us_stock_code
+
+        self.assertEqual(parse_realtime_price('{"close": 55.7, "previousClose": 55.1}'), 55.7)
+        self.assertEqual(parse_realtime_price('{"close": "NA", "previousClose": 55.1}'), 55.1)
+        self.assertIsNone(parse_realtime_price("not json"))
+        self.assertIsNone(parse_realtime_price("[1, 2]"))
+        self.assertEqual(us_stock_code("pcor"), "PCOR.US")
+        self.assertEqual(us_stock_code("VOD.LSE"), "VOD.LSE")
 
 
 if __name__ == "__main__":
