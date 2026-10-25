@@ -66,6 +66,7 @@ from tracker.networth import (
     item_value_egp,
     nw_chart_html,
     snapshot_from_nw,
+    snapshot_usd_exposure,
 )
 from tracker.portfolio import Dividend
 from tracker.prices import fetch_latest_eodhd_close
@@ -2245,18 +2246,34 @@ def nw_snapshot_dialog(
             key=f"{p}{iso}_cd_cash",
         )
     )
-    usd_total_v = float(
-        st.number_input(
-            f"🇺🇸 Total USD Exposure included above (in {CCY}, optional)",
-            min_value=0.0,
-            step=1000.0,
-            format="%.2f",
-            value=float(defaults.get("usd_total_egp", 0.0)),
-            key=f"{p}{iso}_usd_total",
-        )
-    )
-
     total_v = round(stocks_v + us_stocks_v + funds_v + gold_v + fx_v + cd_cash_v, 2)
+    edited_slices = {
+        "stocks_egp": stocks_v, "us_stocks_egp": us_stocks_v, "funds_egp": funds_v,
+        "gold_egp": gold_v, "fx_egp": fx_v, "cd_cash_egp": cd_cash_v,
+    }
+    auto_usd_v = snapshot_usd_exposure(edited_slices, defaults, live_nw)
+    override_usd = st.checkbox(
+        "Override USD exposure manually",
+        value=False,
+        key=f"{p}{iso}_usd_override",
+        help="By default, USD exposure is recalculated from the slices above (it moves with the US Stock, "
+             "Mutual Funds, FX and CDs values you enter). Tick to type an exact figure instead.",
+    )
+    if override_usd:
+        usd_total_v = float(
+            st.number_input(
+                f"🇺🇸 Total USD Exposure included above (in {CCY})",
+                min_value=0.0,
+                step=1000.0,
+                format="%.2f",
+                value=auto_usd_v,
+                key=f"{p}{iso}_usd_total",
+            )
+        )
+    else:
+        usd_total_v = auto_usd_v
+    usd_share = (usd_total_v / total_v * 100.0) if total_v > 0 else 0.0
+    st.caption(f"🇺🇸 USD exposure: **{usd_total_v:,.0f} {CCY}** ({usd_share:.1f}% of total)")
     st.markdown(f"**Snapshot Total on `{iso}`:** `{total_v:,.2f} {CCY}`")
 
     if st.button(
@@ -2283,54 +2300,6 @@ def nw_snapshot_dialog(
             )
             st.session_state["toast"] = f"Saved Net Worth snapshot for {iso} ({total_v:,.0f} {CCY})."
             st.rerun()
-
-
-def _nw_donut_html(nw: dict) -> str:
-    """SVG donut chart + legend inside a dark card matching PORTFOLIO_CSS."""
-    import math
-
-    r = 70.0
-    circumference = 2.0 * math.pi * r
-    offset = 0.0
-    circles = []
-    for s in nw["slices"]:
-        if s["pct"] <= 0:
-            continue
-        dash = (s["pct"] / 100.0) * circumference
-        circles.append(
-            f"<circle r='{r}' cx='95' cy='95' fill='transparent' stroke='{s['color']}' "
-            f"stroke-width='24' stroke-dasharray='{dash:.3f} {circumference:.3f}' "
-            f"stroke-dashoffset='{-offset:.3f}' transform='rotate(-90 95 95)'/>"
-        )
-        offset += dash
-    if not circles:
-        circles.append(
-            f"<circle r='{r}' cx='95' cy='95' fill='transparent' stroke='#262a33' stroke-width='24'/>"
-        )
-
-    legend = []
-    for s in nw["slices"]:
-        legend.append(
-            "<div style='display:flex;justify-content:space-between;align-items:center;"
-            "padding:5px 0;border-bottom:1px solid #262a33;font-size:.88rem'>"
-            f"<span><span class='dot' style='background:{s['color']};display:inline-block;"
-            "width:9px;height:9px;border-radius:50%;margin-right:8px'></span>"
-            f"{_esc(s['label'])}</span>"
-            f"<span style='font-weight:600'>{s['pct']:.1f}% · {egx_money(s['value'])}</span>"
-            "</div>"
-        )
-
-    return (
-        "<div class='pf-card' style='display:flex;flex-direction:column;align-items:center;padding:18px'>"
-        "<svg width='190' height='190' viewBox='0 0 190 190'>"
-        + "".join(circles)
-        + "<text x='95' y='90' text-anchor='middle' fill='#9aa0a6' font-size='11' font-weight='600'>NET WORTH</text>"
-        + f"<text x='95' y='110' text-anchor='middle' fill='#fff' font-size='14' font-weight='700'>{_esc(egx_money(nw['total']))}</text>"
-        + "</svg>"
-        + "<div style='width:100%;margin-top:12px'>"
-        + "".join(legend)
-        + "</div></div>"
-    )
 
 
 def _nw_bars_html(nw: dict, meta_by_key: dict[str, str]) -> str:
@@ -2562,11 +2531,7 @@ def net_worth_tab(
         "cd_cash": " · ".join(cd_parts) if cd_parts else "EGP & FX certificates / cash",
     }
 
-    chart_col, bars_col = st.columns([1, 1.55], gap="large", vertical_alignment="center")
-    with chart_col:
-        st.markdown(_nw_donut_html(nw), unsafe_allow_html=True)
-    with bars_col:
-        st.markdown(_nw_bars_html(nw, meta_by_key), unsafe_allow_html=True)
+    st.markdown(_nw_bars_html(nw, meta_by_key), unsafe_allow_html=True)
 
     # --- Net Worth Over Time (Snapshots Chart) ----------------------------------------
     series = build_snapshot_series(nw_snapshots, today_iso, nw)

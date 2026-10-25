@@ -189,6 +189,7 @@ def compute_net_worth(
     usd_stock_egp = 0.0
     other_fx_egp = 0.0
     egp_non_equity_egp = 0.0
+    usd_fx_slice_egp = 0.0
 
     for it in items:
         v = item_value_egp(it, price_24k, price_21k, usd_egp_rate)
@@ -224,6 +225,7 @@ def compute_net_worth(
             if ccy == "USD":
                 usd_cash_usd += native_v
                 usd_cash_egp += v
+                usd_fx_slice_egp += v
             elif ccy != "EGP":
                 other_fx_egp += v
             else:
@@ -272,6 +274,15 @@ def compute_net_worth(
         "total": total,
         "slices": slices,
         "by_key": {s["key"]: s["value"] for s in slices},
+        # USD-denominated EGP value inside each chart slice (USD cash in the 'cash' category lives in cd_cash)
+        "usd_by_key": {
+            "stocks": 0.0,
+            "us_stocks": usd_stock_egp,
+            "funds": usd_fund_egp,
+            "gold": 0.0,
+            "fx": usd_fx_slice_egp,
+            "cd_cash": usd_total_egp - usd_stock_egp - usd_fund_egp - usd_fx_slice_egp,
+        },
         "stocks_only_egp": stocks_only_val,
         "stock_funds_egp": stock_funds_val,
         "gold_grams_24k": grams_24k,
@@ -312,6 +323,29 @@ def snapshot_from_nw(date_iso: str, nw: dict) -> dict:
         "cd_cash_egp": float(by_k.get("cd_cash", 0.0)),
         "usd_total_egp": float(nw.get("usd_total_egp", 0.0)),
     }
+
+
+SNAPSHOT_SLICE_KEYS = ("stocks", "us_stocks", "funds", "gold", "fx", "cd_cash")
+
+
+def snapshot_usd_exposure(edited: dict, base: dict, live_nw: dict) -> float:
+    """USD exposure (EGP) for a manually edited snapshot, kept consistent with its slice values.
+
+    ``base`` is the snapshot the form was pre-filled with (saved row or live values) and ``edited``
+    holds the values being saved (``<key>_egp`` fields). Starting from ``base['usd_total_egp']``, each
+    slice's change is attributed to USD in proportion to that slice's live USD share, so editing e.g.
+    the US Stock slice moves USD exposure with it instead of leaving a stale pre-filled number.
+    """
+    by_k = live_nw.get("by_key", {})
+    usd_by_k = live_nw.get("usd_by_key", {})
+    usd = float(base.get("usd_total_egp", 0.0))
+    for k in SNAPSHOT_SLICE_KEYS:
+        live_v = float(by_k.get(k, 0.0))
+        frac = (float(usd_by_k.get(k, 0.0)) / live_v) if live_v > 0 else 0.0
+        delta = float(edited.get(f"{k}_egp", 0.0)) - float(base.get(f"{k}_egp", 0.0))
+        usd += delta * min(max(frac, 0.0), 1.0)
+    total = sum(float(edited.get(f"{k}_egp", 0.0)) for k in SNAPSHOT_SLICE_KEYS)
+    return round(min(max(usd, 0.0), total), 2)
 
 
 def build_snapshot_series(
