@@ -115,6 +115,11 @@ _NAMES: dict[str, str] = {
     "DSCW": "Dice Ready-Made Garments",
     "AMIA": "Arab Moltaqa Investments",
     "RACC": "Raya Customer Experience",
+    # Recent listings
+    "HALN": "MNT-Halan",
+    "BQDC": "Banque du Caire",
+    "EEPM": "Egypt Education Platform",
+    "OCAP": "O G Capital for Investments (SPAC)",
 }
 
 # Verified company websites for logo lookup. Symbols absent here render an
@@ -188,3 +193,37 @@ _LOGO_OVERRIDES: dict[str, str] = {
 def resolve_logo(symbol: str) -> Optional[str]:
     """Return a verified logo URL for the symbol, or None to use an initials badge."""
     return _LOGO_OVERRIDES.get(symbol)
+
+
+# Sector per symbol, used by the Allocation tab. Unlisted symbols fall back to "Other".
+_SECTORS: dict[str, str] = {
+    "COMI": "Banks", "BQDC": "Banks", "QNBE": "Banks", "HDBK": "Banks", "ADIB": "Banks", "CANA": "Banks",
+    "CIEB": "Banks", "FAIT": "Banks", "FAITA": "Banks", "EXPA": "Banks",
+    "TMGH": "Real Estate", "PHDC": "Real Estate", "EMFD": "Real Estate", "ORHD": "Real Estate",
+    "OCDI": "Real Estate", "HELI": "Real Estate", "GPPL": "Real Estate", "EGTS": "Real Estate",
+    "ETEL": "Telecom",
+    "FWRY": "Fintech", "EFIH": "Fintech", "VALU": "Fintech", "HALN": "Fintech",
+    "EEPM": "Education", "CIRA": "Education", "TALM": "Education",
+    "ABUK": "Fertilizers & Chemicals", "MFPC": "Fertilizers & Chemicals",
+    "FERC": "Fertilizers & Chemicals", "EGCH": "Fertilizers & Chemicals",
+    "EGAL": "Metals & Industrials", "IRON": "Metals & Industrials", "SWDY": "Metals & Industrials",
+    "ORAS": "Construction", "ARCC": "Building Materials",
+    "EFID": "Consumer", "JUFO": "Consumer", "EAST": "Consumer",
+    "HRHO": "Financial Services", "BTFH": "Financial Services", "CCAP": "Financial Services",
+    "CLHO": "Healthcare", "ALCN": "Transport & Logistics", "SCTS": "Transport & Logistics",
+}
+
+FUND_SECTOR = "Funds"
+
+
+def sector_of(symbol: str, overrides: Optional[dict[str, str]] = None) -> str:
+    """Sector for a symbol; user ``overrides`` win over the built-in map."""
+    if overrides and overrides.get(symbol):
+        return overrides[symbol]
+    return _SECTORS.get(symbol, "Other")
+
+
+def known_sectors(overrides: Optional[dict[str, str]] = None) -> list[str]:
+    """Every sector name in use (built-in + overrides), for pickers."""
+    names = set(_SECTORS.values()) | set((overrides or {}).values()) | {"Other", FUND_SECTOR}
+    return sorted(names)

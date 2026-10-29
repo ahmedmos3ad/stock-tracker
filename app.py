@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 # Locates the .env file exactly where app.py lives, regardless of terminal path
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import importlib
@@ -45,7 +45,7 @@ from tracker.calculator import (
     simulate_dca,
     simulate_sell,
 )
-from tracker.chart import HEIGHT as CARD_HEIGHT, card_html
+from tracker.chart import ALPHA_HEIGHT, HEIGHT as CARD_HEIGHT, alpha_card_html, card_html
 from tracker.history import EGX30_SYMBOL, fetch_history
 from tracker.networth import (
     CAT_CASH,
@@ -75,6 +75,7 @@ from tracker.networth import (
     snapshot_usd_exposure,
 )
 from tracker import nw_insights as nwi
+from tracker import insights as ins
 from tracker.market import USD_EGP_CODE, fetch_realtime_price, us_stock_code
 from tracker.portfolio import Dividend
 from tracker.prices import fetch_latest_eodhd_close
@@ -410,6 +411,8 @@ if "toast" in st.session_state:
 ) = load_data(store.data_version, os.stat(store.db_path).st_mtime_ns)
 fund_symbols = set(fund_rows)  # symbols flagged as funds: priced by hand, never synced from EODHD
 app_settings = dict(settings_rows)  # persisted preferences (deposit rate, size limit, ...)
+sector_overrides = ins.load_sector_overrides(app_settings.get(ins.SETTING_SECTOR_OVERRIDES))
+dca_plans = ins.load_dca_plans(app_settings.get(ins.SETTING_DCA_PLANS))
 
 
 def setting_float(key: str, default: float) -> float:
@@ -659,6 +662,42 @@ def allocation_rows(held, limit_pct: float):
     return rows
 
 
+def sector_rows(rows):
+    """Aggregate allocation rows by sector (funds grouped on their own; user overrides applied)."""
+    return ins.aggregate_sectors(
+        [(r["p"].symbol, r["value"], r["p"].cost_basis_remaining) for r in rows],
+        fund_symbols, sector_overrides,
+    )
+
+
+def sector_html(srows, limit_pct: float) -> str:
+    max_w = max((max(a["w"], a["cw"]) for a in srows), default=1.0) or 1.0
+    out = []
+    for a in srows:
+        tone = _tone(a["ret"])
+        over = a["w"] > limit_pct and a["sector"] != companies.FUND_SECTOR
+        border = "#f1c40f" if over else "#2a2e37"
+        flag = (
+            "<span class='al-flag' style='color:#f1c40f;background:rgba(241,196,15,.15)'>Concentrated</span>"
+            if over else ""
+        )
+        pill = (
+            f"<span class='al-flag' style='color:{tone};background:{_TONE_BG[tone]}'>{pct(a['ret'] / 100)}</span>"
+            if a["ret"] is not None else ""
+        )
+        out.append(
+            f"<div class='al-row' style='border-left-color:{border}'>"
+            f"<div class='al-id'>{_esc(a['sector'])}</div>"
+            f"<div class='al-track'><div class='al-fill' style='width:{min(a['w'] / max_w * 100, 100):.1f}%;background:{tone}'></div>"
+            f"<div class='al-mark' style='left:{min(a['cw'] / max_w * 100, 100):.1f}%' title='Weight at cost'></div></div>"
+            f"<div class='al-w'>{a['w']:.1f}%</div>"
+            f"<div class='al-meta'>{egx_money(a['value'])}{pill}{flag}<br>"
+            f"{_esc(', '.join(a['symbols']))}</div>"
+            "</div>"
+        )
+    return "".join(out)
+
+
 def allocation_html(rows) -> str:
     max_w = max((max(r["w"], r["cw"]) for r in rows), default=1.0) or 1.0
     out = []
@@ -696,6 +735,31 @@ def allocation_html(rows) -> str:
     return "".join(out)
 
 
+def _concentration_banner(held) -> None:
+    """Warn when a stock or sector is above its limit, and when a DCA plan is due/overdue."""
+    if not held:
+        return
+    stock_limit = st.session_state.get("pf_limit", setting_float("size_limit", 20.0))
+    sector_limit = st.session_state.get("pf_sector_limit", setting_float(ins.SETTING_SECTOR_LIMIT, ins.DEFAULT_SECTOR_LIMIT))
+    rows = allocation_rows(held, stock_limit)
+    alerts = ins.concentration_alerts(
+        [{"symbol": r["p"].symbol, "w": r["w"]} for r in rows], sector_rows(rows),
+        stock_limit, sector_limit, fund_symbols,
+    )
+    if alerts:
+        st.warning("**Concentration alerts**\n" + "\n".join(f"- {m}" for m in alerts))
+    today_ = cairo_today()
+    held_syms = {p.symbol for p in held}
+    for sym, plan in sorted(dca_plans.items()):
+        if sym not in held_syms:
+            continue
+        stt = ins.dca_plan_status(plan, ins.last_buy_date(txns, sym), today_)
+        if stt["status"] == "overdue":
+            st.error(f"🔴 DCA plan for **{sym}** ({plan['amount']:,.0f} {CCY} {plan['frequency'].lower()}) is overdue — was due {stt['next_due']}.")
+        elif stt["status"] == "due":
+            st.info(f"🟡 DCA plan for **{sym}** ({plan['amount']:,.0f} {CCY} {plan['frequency'].lower()}) is due now.")
+
+
 PORTFOLIO_SORTS = {
     "Most underwater": lambda p: p.breakeven_pct if p.breakeven_pct is not None else float("inf"),
     "Market value": lambda p: -(p.market_value or 0),
@@ -725,6 +789,8 @@ def portfolio_tab(positions) -> None:
 
     held = [p for p in positions if p.quantity > 0]
     closed = [p for p in positions if p.quantity <= 0]
+
+    _concentration_banner(held)
 
     head_col, sort_col = st.columns([1, 2], vertical_alignment="center")
     head_col.subheader(f"Holdings ({len(held)})")
@@ -811,7 +877,100 @@ def allocation_tab(positions) -> None:
         f"{len(risky)} in the red" if risky else None, delta_color="inverse",
     )
 
-    st.markdown(allocation_html(rows), unsafe_allow_html=True)
+    by_stock, by_sector, by_dd = st.tabs(["By stock", "By sector", "Drawdown"])
+    with by_stock:
+        st.markdown(allocation_html(rows), unsafe_allow_html=True)
+    with by_sector:
+        sec_limit = st.number_input(
+            "Flag sectors above (%)", min_value=1.0, max_value=100.0,
+            value=setting_float(ins.SETTING_SECTOR_LIMIT, ins.DEFAULT_SECTOR_LIMIT), step=1.0,
+            key="pf_sector_limit", on_change=_save_setting, args=("pf_sector_limit", ins.SETTING_SECTOR_LIMIT),
+            help="Separate from the single-stock limit, since a sector holds several stocks. Saved automatically.",
+        )
+        st.caption(
+            "Holdings grouped by sector, so you can see concentration that per-stock weights hide. "
+            "Pill = return vs cost basis; sectors above the sector limit are flagged."
+        )
+        st.markdown(sector_html(sector_rows(rows), sec_limit), unsafe_allow_html=True)
+        sector_editor(held)
+    with by_dd:
+        drawdown_view(held)
+
+
+def sector_editor(held) -> None:
+    """Let the user re-assign a holding's sector (saved as overrides on top of the built-in map)."""
+    with st.expander("✏️ Edit sector assignments"):
+        new_name = st.text_input("Add a new sector name (optional)", key="sec_new_name").strip()
+        options = companies.known_sectors(sector_overrides)
+        if new_name and new_name not in options:
+            options = sorted(options + [new_name])
+        syms = sorted(p.symbol for p in held if p.symbol not in fund_symbols)
+        df = pd.DataFrame(
+            {"Symbol": syms, "Sector": [companies.sector_of(x, sector_overrides) for x in syms]}
+        )
+        edited = st.data_editor(
+            df, hide_index=True, use_container_width=True, key="sec_editor", disabled=["Symbol"],
+            column_config={"Sector": st.column_config.SelectboxColumn("Sector", options=options, required=True)},
+        )
+        if st.button("Save sectors", key="sec_save"):
+            new = dict(sector_overrides)
+            for sym, sec in zip(edited["Symbol"], edited["Sector"]):
+                if sec == companies.sector_of(sym):  # same as the built-in map -> no override needed
+                    new.pop(sym, None)
+                else:
+                    new[sym] = sec
+            store.set_setting(ins.SETTING_SECTOR_OVERRIDES, ins.dump_sector_overrides(new))
+            st.session_state["toast"] = "Saved sector assignments."
+            st.rerun()
+        st.caption("Only differences from the built-in sector map are saved, so new IPOs need no code change.")
+
+
+def drawdown_view(held) -> None:
+    """How far each holding sits below its high, and for how long (from saved daily closes)."""
+    rows = []
+    for p in held:
+        if p.symbol in fund_symbols:
+            continue
+        st_ = ins.drawdown_stats(price_history.get(p.symbol, []), saved_prices.get(p.symbol))
+        if st_ is None:
+            continue
+        rows.append(
+            {
+                "Symbol": p.symbol,
+                "Sector": companies.sector_of(p.symbol, sector_overrides),
+                "Price": st_["current"],
+                "High": st_["high"],
+                "High date": st_["high_date"],
+                "From high %": st_["from_high_pct"],
+                "Days since high": st_["days_since_high"],
+                "Vs break-even %": (p.breakeven_pct * 100) if p.breakeven_pct is not None else None,
+            }
+        )
+    ix = ins.drawdown_stats(price_history.get(EGX30_SYMBOL, []), saved_prices.get(EGX30_SYMBOL))
+    if not rows:
+        st.info("No saved price history yet. Use **Backfill price history** on the Performance tab.")
+        return
+    if ix:
+        c1, c2 = st.columns(2)
+        c1.metric("EGX30 from its high", f"{ix['from_high_pct']:+.1f}%", f"{ix['days_since_high']} days ago", delta_color="off")
+        worst = min(rows, key=lambda r: r["From high %"])
+        c2.metric("Deepest holding", f"{worst['Symbol']} {worst['From high %']:+.1f}%", delta_color="off")
+    df = pd.DataFrame(rows).sort_values("From high %")
+    st.dataframe(
+        df.style.map(lambda v: f"color: {_tone(v if v == v else None)}; font-weight: 600",
+                     subset=["From high %", "Vs break-even %"])
+        .format({"Price": "{:,.2f}", "High": "{:,.2f}", "From high %": "{:+.1f}%",
+                 "Vs break-even %": lambda v: "—" if v is None or v != v else f"{v:+.1f}%",
+                 "Days since high": "{:,}"}),
+        hide_index=True, use_container_width=True,
+    )
+    first = min((pts[0][0] for pts in price_history.values() if pts), default=None)
+    st.caption(
+        "Highs are measured over your saved daily closes"
+        + (f" (since {first})" if first else "")
+        + ", so an older peak outside that window isn't counted. A stock far below its high isn't "
+        "necessarily cheap — check that the business hasn't changed."
+    )
 
 
 with tab_portfolio:
@@ -1327,6 +1486,181 @@ def sell_planner(held: dict, saved_prices: dict, funds) -> None:
     )
 
 
+def rebalance_view(held: dict, saved_prices: dict, funds) -> None:
+    """Turn the concentration limits into actions: what to trim, and where there's room to add."""
+    stock_limit = st.session_state.get("pf_limit", setting_float("size_limit", 20.0))
+    sector_limit = st.session_state.get(
+        "pf_sector_limit", setting_float(ins.SETTING_SECTOR_LIMIT, ins.DEFAULT_SECTOR_LIMIT)
+    )
+    values = {
+        s_: (q.market_value if q.market_value is not None else q.cost_basis_remaining)
+        for s_, q in held.items()
+    }
+    plan = ins.rebalance_plan(values, funds, sector_overrides, sector_limit, stock_limit)
+    st.caption(
+        f"Based on your limits: **{stock_limit:g}%** per stock and **{sector_limit:g}%** per sector "
+        "(change them on the Allocation tab). Trims assume the proceeds stay invested elsewhere in your "
+        "wallet. Values are at your saved prices, before fees."
+    )
+
+    def _shares(sym: str, amount: float) -> int | None:
+        px = saved_prices.get(sym)
+        if not px:
+            return None
+        return min(held[sym].quantity, int(-(-amount // px)))
+
+    overs = plan["overs"]
+    if not overs:
+        st.success("You're within both limits. Nothing needs trimming.")
+    for o in overs:
+        label = "sector" if o["kind"] == "sector" else "stock"
+        st.markdown(
+            f"#### {o['name']} {label}: {o['weight']:.1f}% "
+            f"<span style='color:{RED}'>(limit {o['limit']:g}%)</span>",
+            unsafe_allow_html=True,
+        )
+        c1, c2 = st.columns(2)
+        c1.metric("Trim to get under the limit", money(o["excess"]), delta_color="off")
+        c2.metric(
+            "Or add new money elsewhere", money(max(o["dilute_cash"], 0.0)), delta_color="off",
+            help="Cash you'd add to other holdings so this one falls under its limit without selling.",
+        )
+        rows = [
+            {
+                "Symbol": t["symbol"],
+                f"Sell ({CCY})": t["amount"],
+                "≈ Shares": _shares(t["symbol"], t["amount"]),
+                "Price": saved_prices.get(t["symbol"]),
+            }
+            for t in o["trims"]
+        ]
+        st.dataframe(
+            pd.DataFrame(rows), hide_index=True, use_container_width=True,
+            column_config={
+                f"Sell ({CCY})": st.column_config.NumberColumn(format="%.0f"),
+                "Price": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+
+    # --- where to deploy -------------------------------------------------------------
+    st.subheader("Where there's room")
+    over_sectors = {o["name"] for o in overs if o["kind"] == "sector"}
+    over_sector_syms = {s_ for o in overs if o["kind"] == "sector" for s_ in o["symbols"]}
+    redeploy = sum(o["excess"] for o in overs if o["kind"] == "sector") + sum(
+        o["excess"] for o in overs if o["kind"] == "stock" and o["name"] not in over_sector_syms
+    )
+    new_cash = st.number_input(
+        f"New cash to deploy ({CCY})", min_value=0.0, step=1000.0, value=0.0, key="rebal_cash",
+        help="Leave at 0 to size the suggestion from the amount you'd trim.",
+    )
+    amount = new_cash if new_cash > 0 else redeploy
+    rooms = {k: v for k, v in plan["sector_room"].items() if k not in over_sectors}
+    alloc = ins.allocate_cash(rooms, amount) if amount > 0 else {}
+
+    members: dict[str, list[str]] = {}
+    for s_ in held:
+        if s_ not in funds:
+            members.setdefault(companies.sector_of(s_, sector_overrides), []).append(s_)
+    cur_w = {
+        k: sum(values[s_] for s_ in v) / plan["total"] * 100 for k, v in members.items()
+    } if plan["total"] else {}
+    rows = []
+    for sec_, room in sorted(rooms.items(), key=lambda kv: -kv[1]):
+        cands = sorted(
+            (s_ for s_ in members.get(sec_, []) if plan["stock_room"].get(s_, 0) > 0),
+            key=lambda x: -plan["stock_room"][x],
+        )
+        rows.append(
+            {
+                "Sector": sec_,
+                "Now %": cur_w.get(sec_, 0.0),
+                f"Room ({CCY})": room,
+                f"Suggested ({CCY})": alloc.get(sec_, 0.0),
+                "Holdings with room": ", ".join(cands) if cands else "—",
+            }
+        )
+    if rows:
+        st.dataframe(
+            pd.DataFrame(rows), hide_index=True, use_container_width=True,
+            column_config={
+                "Now %": st.column_config.NumberColumn(format="%.1f%%"),
+                f"Room ({CCY})": st.column_config.NumberColumn(format="%.0f"),
+                f"Suggested ({CCY})": st.column_config.NumberColumn(format="%.0f"),
+            },
+        )
+        if amount > 0 and sum(alloc.values()) + 1 < amount:
+            st.warning(
+                f"Only {sum(alloc.values()):,.0f} {CCY} of the {amount:,.0f} {CCY} fits under your limits "
+                "in the sectors you already hold. The rest would need a new sector or a higher limit."
+            )
+        st.caption(
+            "Suggestions split the amount in proportion to each sector's headroom. Sectors you don't hold yet "
+            "aren't listed. This is a limits check, not a view on valuations: check the business before buying."
+        )
+    else:
+        st.info("Every sector you hold is at its limit.")
+
+
+def dca_plans_view(held: dict, saved_prices: dict) -> None:
+    """Fixed-amount, fixed-schedule buying plans with on-track / due / overdue status."""
+    st.caption(
+        "Set a fixed amount and schedule per stock. The app compares it to your actual buys and "
+        "flags plans that are due or overdue (also shown at the top of the Portfolio tab)."
+    )
+    today_ = cairo_today()
+    if dca_plans:
+        rows = []
+        for sym, plan in sorted(dca_plans.items()):
+            last = ins.last_buy_date(txns, sym)
+            stt = ins.dca_plan_status(plan, last, today_)
+            px = saved_prices.get(sym)
+            icon = {"on track": "✅", "due": "🟡", "overdue": "🔴", "not started": "⏳"}[stt["status"]]
+            rows.append(
+                {
+                    "Symbol": sym,
+                    f"Amount ({CCY})": plan["amount"],
+                    "Schedule": plan["frequency"],
+                    "Shares @ price": int(plan["amount"] // px) if px else None,
+                    "Last buy": last or "—",
+                    "Next due": stt["next_due"].isoformat(),
+                    "Status": f"{icon} {stt['status']}",
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(rows), hide_index=True, use_container_width=True,
+            column_config={f"Amount ({CCY})": st.column_config.NumberColumn(format="%.0f")},
+        )
+    else:
+        st.info("No plans yet. Add one below.")
+
+    st.subheader("Add / update a plan")
+    c1, c2, c3, c4 = st.columns(4)
+    sym = c1.selectbox("Stock", sorted(held), format_func=companies.display_label, key="plan_sym")
+    existing = dca_plans.get(sym, {})
+    amount = c2.number_input(
+        f"Amount per buy ({CCY})", min_value=0.0, step=500.0,
+        value=float(existing.get("amount", 5000.0)), key=f"plan_amt_{sym}",
+    )
+    freq = c3.selectbox(
+        "Schedule", list(ins.FREQ_DAYS),
+        index=list(ins.FREQ_DAYS).index(existing.get("frequency", "Monthly")), key=f"plan_freq_{sym}",
+    )
+    start_default = date.fromisoformat(existing["start"]) if existing.get("start") else today_
+    start = c4.date_input("Start date", value=start_default, key=f"plan_start_{sym}")
+    b1, b2, _ = st.columns([1, 1, 3])
+    if b1.button("Save plan", type="primary", key="plan_save", disabled=amount <= 0):
+        new = dict(dca_plans)
+        new[sym] = {"amount": amount, "frequency": freq, "start": start.isoformat()}
+        store.set_setting(ins.SETTING_DCA_PLANS, ins.dump_dca_plans(new))
+        st.session_state["toast"] = f"Saved DCA plan for {sym}."
+        st.rerun()
+    if sym in dca_plans and b2.button("Delete plan", key="plan_del"):
+        new = {k: v for k, v in dca_plans.items() if k != sym}
+        store.set_setting(ins.SETTING_DCA_PLANS, ins.dump_dca_plans(new))
+        st.session_state["toast"] = f"Deleted DCA plan for {sym}."
+        st.rerun()
+
+
 @st.fragment
 def dca_tab(positions, saved_prices: dict, funds) -> None:
     held = {p.symbol: p for p in positions if p.quantity > 0}
@@ -1335,11 +1669,17 @@ def dca_tab(positions, saved_prices: dict, funds) -> None:
         return
 
     action = st.radio(
-        "Plan", ["Buy more (DCA)", "Sell / trim"], horizontal=True, key="plan_action",
+        "Plan", ["Buy more (DCA)", "Sell / trim", "Rebalance", "My DCA plans"], horizontal=True, key="plan_action",
         label_visibility="collapsed",
     )
     if action == "Sell / trim":
         sell_planner(held, saved_prices, funds)
+        return
+    if action == "Rebalance":
+        rebalance_view(held, saved_prices, funds)
+        return
+    if action == "My DCA plans":
+        dca_plans_view(held, saved_prices)
         return
 
     st.caption(
@@ -1457,6 +1797,35 @@ def dca_tab(positions, saved_prices: dict, funds) -> None:
                 f"{limit_now:g}% size limit (set on the Allocation tab)."
             )
 
+        # Sector concentration: same valuation as above (others as-is, this stock at the DCA price).
+        values = {
+            s_: (q.market_value if q.market_value is not None else q.cost_basis_remaining)
+            for s_, q in held.items()
+        }
+        sec = ins.sector_share_after_buy(values, sym, value_before, value_after, funds, sector_overrides)
+        sector, mates = sec["sector"], sec["mates"]
+        sec_before, sec_after = sec["before"], sec["after"]
+        sec_limit_now = st.session_state.get(
+            "pf_sector_limit", setting_float(ins.SETTING_SECTOR_LIMIT, ins.DEFAULT_SECTOR_LIMIT)
+        )
+
+        c10, c11 = st.columns(2)
+        c10.metric(
+            f"{sector} sector share", f"{sec_after:.1f}%", f"{sec_after - sec_before:+.1f} pp",
+            delta_color="off",
+            help="Sector value ÷ total value of your open positions, at the DCA price. "
+                 "Includes " + (", ".join([sym] + mates)) + ".",
+        )
+        c11.metric(
+            "Sector holdings", ", ".join([sym] + mates),
+            f"{sec_before:.1f}% before", delta_color="off",
+        )
+        if sec_after > sec_limit_now and sector != companies.FUND_SECTOR:
+            st.warning(
+                f"This would make the **{sector}** sector **{sec_after:.1f}%** of your wallet "
+                f"(from {sec_before:.1f}%), above your {sec_limit_now:g}% sector limit."
+            )
+
         if r.broker_pct_improvement is not None and r.cost > 0:
             per_k = r.broker_pct_improvement * 100 / (r.cost / 1000)
             st.markdown(
@@ -1518,6 +1887,21 @@ def _yr(x: float | None) -> str:
     if x is None:
         return "—"
     return ">+999%" if x > 9.99 else f"{x * 100:+.1f}%"
+
+
+def _alpha_section(curve: list[dict], index_points: list, today: str) -> None:
+    """Cumulative alpha vs EGX30 (time-weighted, so deposits don't count as gains)."""
+    st.subheader("Alpha vs EGX30")
+    if not index_points:
+        st.info("Backfill price history (EGX30 included) to see alpha.")
+        return
+    components.html(alpha_card_html(curve, index_points), height=ALPHA_HEIGHT)
+    st.caption(
+        "Hover for any day; ranges are rebased to zero at their start. Time-weighted, so deposits and "
+        "withdrawals aren't counted as gains. Alpha = your return minus the index's; above zero means you're "
+        "beating EGX30. Days before your saved price history starts use your last trade price, so early "
+        "figures are approximate."
+    )
 
 
 @st.fragment
@@ -1620,6 +2004,8 @@ def perf_tab(positions, adj_txns, dividends, history, price_entries) -> None:
         card_html(df, max(stamps) if stamps else today, CCY, index_history=curve_history.get(EGX30_SYMBOL)),
         height=CARD_HEIGHT,
     )
+    _alpha_section(curve, curve_history.get(EGX30_SYMBOL, []), today)
+
     priced_days = len({d for s in held_symbols for d, _ in history.get(s, [])})
     st.caption(
         f"Portfolio value includes dividends received; gap to net deposits = total profit. Built from {priced_days:,} days of saved "

@@ -767,5 +767,166 @@ class NetWorthManagementTests(unittest.TestCase):
         self.assertEqual(us_stock_code("VOD.LSE"), "VOD.LSE")
 
 
+class InsightsTests(unittest.TestCase):
+    def test_sector_aggregation_and_funds(self):
+        from tracker import insights as ins
+
+        rows = ins.aggregate_sectors(
+            [("TMGH", 600.0, 700.0), ("PHDC", 200.0, 300.0), ("COMI", 100.0, 100.0), ("NBE05", 100.0, 100.0)],
+            funds={"NBE05"},
+        )
+        by = {r["sector"]: r for r in rows}
+        self.assertEqual(rows[0]["sector"], "Real Estate")
+        self.assertAlmostEqual(by["Real Estate"]["w"], 80.0)
+        self.assertAlmostEqual(by["Real Estate"]["ret"], (800 / 1000 - 1) * 100)
+        self.assertIn("Funds", by)
+        self.assertAlmostEqual(sum(r["w"] for r in rows), 100.0)
+
+    def test_override_wins_and_unknown_is_other(self):
+        from tracker import companies as c
+        from tracker import insights as ins
+
+        self.assertEqual(c.sector_of("ZZZZ"), "Other")
+        self.assertEqual(c.sector_of("ZZZZ", {"ZZZZ": "Mining"}), "Mining")
+        self.assertEqual(ins.sector_for("TMGH", overrides={"TMGH": "Holding"}), "Holding")
+        self.assertIn("Mining", c.known_sectors({"ZZZZ": "Mining"}))
+
+    def test_sector_share_after_buy(self):
+        from tracker import insights as ins
+
+        values = {"TMGH": 400.0, "PHDC": 100.0, "COMI": 500.0}
+        r = ins.sector_share_after_buy(values, "TMGH", 400.0, 600.0)
+        self.assertEqual(r["sector"], "Real Estate")
+        self.assertEqual(r["mates"], ["PHDC"])
+        self.assertAlmostEqual(r["before"], 50.0)            # 500 / 1000
+        self.assertAlmostEqual(r["after"], 700 / 1200 * 100)  # buy grows the wallet too
+
+    def test_concentration_alerts(self):
+        from tracker import insights as ins
+
+        stocks = [{"symbol": "TMGH", "w": 25.0}, {"symbol": "NBE05", "w": 30.0}]
+        sectors = [{"sector": "Real Estate", "w": 45.0, "symbols": ["TMGH", "PHDC"]},
+                   {"sector": "Funds", "w": 30.0, "symbols": ["NBE05"]}]
+        msgs = ins.concentration_alerts(stocks, sectors, 20.0, 40.0, funds={"NBE05"})
+        self.assertEqual(len(msgs), 2)  # TMGH over stock limit, Real Estate over sector limit; funds exempt
+        self.assertEqual(ins.concentration_alerts(stocks, sectors, 50.0, 50.0, funds={"NBE05"}), [])
+
+    def test_drawdown_stats(self):
+        from tracker import insights as ins
+
+        pts = [("2026-06-01", 100.0), ("2026-07-01", 120.0), ("2026-10-01", 90.0)]
+        d = ins.drawdown_stats(pts)
+        self.assertEqual(d["high"], 120.0)
+        self.assertEqual(d["high_date"], "2026-07-01")
+        self.assertAlmostEqual(d["from_high_pct"], -25.0)
+        self.assertEqual(d["days_since_high"], 92)
+        up = ins.drawdown_stats(pts, current=130.0)  # live price above any saved close
+        self.assertEqual(up["from_high_pct"], 0.0)
+        self.assertEqual(up["days_since_high"], 0)
+        self.assertIsNone(ins.drawdown_stats([]))
+
+    def test_dca_plan_status(self):
+        from datetime import date as D
+        from tracker import insights as ins
+
+        plan = {"amount": 1000.0, "frequency": "Weekly", "start": "2026-10-01"}
+        today = D(2026, 10, 29)
+        self.assertEqual(ins.dca_plan_status(plan, "2026-10-26", today)["status"], "on track")
+        self.assertEqual(ins.dca_plan_status(plan, "2026-10-22", today)["status"], "due")      # due 10-29
+        self.assertEqual(ins.dca_plan_status(plan, "2026-10-10", today)["status"], "overdue")  # due 10-17
+        self.assertEqual(ins.dca_plan_status(plan, None, today)["status"], "overdue")          # due 10-08
+        future = {"amount": 1.0, "frequency": "Monthly", "start": "2026-11-15"}
+        self.assertEqual(ins.dca_plan_status(future, None, today)["status"], "not started")
+
+    def test_json_roundtrip_and_garbage(self):
+        from tracker import insights as ins
+
+        plans = {"TMGH": {"amount": 5000.0, "frequency": "Monthly", "start": "2026-10-01"}}
+        self.assertEqual(ins.load_dca_plans(ins.dump_dca_plans(plans)), plans)
+        self.assertEqual(ins.load_dca_plans("not json"), {})
+        self.assertEqual(ins.load_dca_plans(None), {})
+        self.assertEqual(ins.load_sector_overrides(ins.dump_sector_overrides({"A": "X", "B": " "})), {"A": "X"})
+
+    def test_rebased_comparison_and_index_return(self):
+        from tracker import insights as ins
+
+        nw = [{"date": "2026-10-10", "total_egp": 1000.0}, {"date": "2026-10-20", "total_egp": 1100.0}]
+        ix = [("2026-10-09", 50000.0), ("2026-10-20", 45000.0)]
+        out = ins.rebased_comparison(nw, ix)
+        self.assertEqual(out[0]["Net worth"], 100.0)
+        self.assertAlmostEqual(out[1]["Net worth"], 110.0)
+        self.assertAlmostEqual(out[1]["EGX30"], 90.0)
+        self.assertEqual(ins.rebased_comparison([], ix), [])
+        self.assertAlmostEqual(ins.index_return_pct(ix, "2026-10-09"), -10.0)
+
+    def test_rebalance_plan(self):
+        from tracker import insights as ins
+
+        values = {"TMGH": 500.0, "PHDC": 100.0, "COMI": 200.0, "ETEL": 100.0, "NBE05": 100.0}
+        plan = ins.rebalance_plan(values, funds={"NBE05"}, sector_limit=40.0, stock_limit=30.0)
+        self.assertEqual(plan["total"], 1000.0)
+        by = {(o["kind"], o["name"]): o for o in plan["overs"]}
+        re_ = by[("sector", "Real Estate")]            # 600 of 1000, limit 400
+        self.assertAlmostEqual(re_["excess"], 200.0)
+        self.assertAlmostEqual(sum(t["amount"] for t in re_["trims"]), 200.0)
+        self.assertEqual(re_["trims"][0]["symbol"], "TMGH")  # largest holding trimmed first
+        self.assertAlmostEqual(re_["dilute_cash"], 500.0)    # 600 / 0.4 - 1000
+        self.assertAlmostEqual(by[("stock", "TMGH")]["excess"], 200.0)  # 500 vs 300 cap
+        self.assertNotIn(("sector", "Funds"), by)             # funds never flagged
+        self.assertNotIn("Funds", plan["sector_room"])
+        self.assertAlmostEqual(plan["sector_room"]["Banks"], 200.0)     # cap 400 - 200
+        self.assertEqual(plan["sector_room"]["Real Estate"], 0.0)
+        self.assertEqual(ins.rebalance_plan({}, ())["overs"], [])
+
+    def test_allocate_cash(self):
+        from tracker import insights as ins
+
+        out = ins.allocate_cash({"A": 100.0, "B": 300.0, "C": 0.0}, 200.0)
+        self.assertAlmostEqual(out["A"], 50.0)
+        self.assertAlmostEqual(out["B"], 150.0)
+        self.assertNotIn("C", out)
+        capped = ins.allocate_cash({"A": 10.0, "B": 300.0}, 400.0)  # more cash than total room
+        self.assertAlmostEqual(capped["A"], 10.0)            # never exceeds headroom
+        self.assertAlmostEqual(capped["B"], 300.0)
+        self.assertAlmostEqual(sum(ins.allocate_cash({"A": 50.0}, 500.0).values()), 50.0)
+
+    def test_alpha_series(self):
+        from tracker import insights as ins
+
+        curve = [
+            {"date": "2026-01-01", "value": 1000.0, "contributed": 1000.0},
+            {"date": "2026-01-02", "value": 1100.0, "contributed": 1000.0},  # +10%
+            {"date": "2026-01-03", "value": 2100.0, "contributed": 2000.0},  # deposit 1000, +0% on the day
+        ]
+        ix = [("2026-01-01", 100.0), ("2026-01-02", 105.0), ("2026-01-03", 105.0)]
+        rows = ins.alpha_series(curve, ix, "2026-01-01")
+        self.assertAlmostEqual(rows[-1]["portfolio_pct"], 10.0)  # the deposit isn't a gain
+        self.assertAlmostEqual(rows[-1]["index_pct"], 5.0)
+        self.assertAlmostEqual(rows[-1]["alpha_pp"], 5.0)
+        self.assertEqual(ins.alpha_series(curve, [], "2026-01-01"), [])
+        self.assertEqual(ins.alpha_series(curve, ix, "2026-01-03"), [])  # needs 2+ days
+
+    def test_modified_dietz_ytd(self):
+        from tracker import insights as ins
+
+        # No flows: value 1000 -> 1100 over the year = +10%.
+        curve = [
+            {"date": "2025-12-31", "value": 1000.0, "contributed": 1000.0},
+            {"date": "2026-01-01", "value": 1000.0, "contributed": 1000.0},
+            {"date": "2026-01-11", "value": 1100.0, "contributed": 1000.0},
+        ]
+        r = ins.modified_dietz_ytd(curve, "2026-01-01")
+        self.assertAlmostEqual(r["profit"], 100.0)
+        self.assertAlmostEqual(r["return_pct"], 10.0)
+        # A deposit must not count as profit.
+        curve2 = [
+            {"date": "2025-12-31", "value": 1000.0, "contributed": 1000.0},
+            {"date": "2026-01-01", "value": 1000.0, "contributed": 1000.0},
+            {"date": "2026-01-11", "value": 1600.0, "contributed": 1500.0},
+        ]
+        self.assertAlmostEqual(ins.modified_dietz_ytd(curve2, "2026-01-01")["profit"], 100.0)
+        self.assertIsNone(ins.modified_dietz_ytd(curve[:1], "2026-01-01"))
+
+
 if __name__ == "__main__":
     unittest.main()
