@@ -516,9 +516,9 @@ adj_txns = apply_corporate_actions(txns, all_action_rows)
 positions = compute_positions(adj_txns, dividends=all_dividends_obj, prices=saved_prices)
 symbols = sorted({t.symbol for t in txns})
 
-(tab_portfolio, tab_allocation, tab_perf, tab_dca, tab_prices, tab_txns, tab_dividends, tab_networth) = st.tabs(
+(tab_portfolio, tab_allocation, tab_perf, tab_heatmap, tab_dca, tab_prices, tab_txns, tab_dividends, tab_networth) = st.tabs(
     [
-        "📊 Portfolio", "🥧 Allocation", "📈 Performance", "🧮 Buy / Sell Planner",
+        "📊 Portfolio", "🥧 Allocation", "📈 Performance", "🗺️ Heatmap", "🧮 Buy / Sell Planner",
         "💲 Prices", "🧾 Transactions", "💰 Dividends", "🏦 Net Worth",
     ]
 )
@@ -2054,6 +2054,189 @@ def perf_tab(positions, adj_txns, dividends, history, price_entries) -> None:
 
 with tab_perf:
     perf_tab(positions, adj_txns, all_dividends_obj, price_history, saved_price_entries)
+
+
+# --- Heatmap tab ----------------------------------------------------------------
+_HM_W, _HM_H = 2.5, 1.0   # layout canvas aspect (the map is drawn ~2.5x wider than tall)
+_HM_PX_W, _HM_PX_H = 1100, 440
+
+
+def _heat_rows(held, period: str) -> list[dict]:
+    """One row per held stock with its % change over ``period`` (funds have no price history)."""
+    today_ = cairo_today()
+    rows = []
+    for p in held:
+        if p.symbol in fund_symbols:
+            continue
+        chg = ins.period_return(price_history.get(p.symbol, []), saved_prices.get(p.symbol), today_, period)
+        value = p.market_value if p.market_value is not None else p.cost_basis_remaining
+        rows.append(
+            {
+                "symbol": p.symbol, "value": value, "chg": chg, "price": saved_prices.get(p.symbol),
+                "sector": companies.sector_of(p.symbol, sector_overrides),
+                "name": (companies.COMPANIES.get(p.symbol) or {}).get("name") or p.symbol,
+            }
+        )
+    return rows
+
+
+HM_BANDS = "Bands (1 · 2 · 3%)"
+
+
+def _tile_color(chg: float, scale: str) -> str:
+    """Discrete Thndr-style bands by default; or a smooth blend capped at ±N%."""
+    if scale == HM_BANDS:
+        return ins.band_color(chg)
+    return ins.heat_color(chg, float(scale.rstrip("%").replace("Smooth ±", "")))
+
+
+def treemap_html(rows: list[dict], size_by: str, scale: str) -> str:
+    items = [(r["symbol"], r["value"] if size_by == "Market value" else 1.0) for r in rows if r["chg"] is not None]
+    rects = ins.treemap_layout(items, _HM_W, _HM_H)
+    by = {r["symbol"]: r for r in rows}
+    out = [f"<div style='position:relative;width:100%;height:{_HM_PX_H}px;background:#0e1117;border-radius:6px;overflow:hidden'>"]
+    for rc in rects:
+        r = by[rc["key"]]
+        wpx, hpx = rc["w"] / _HM_W * _HM_PX_W, rc["h"] / _HM_H * _HM_PX_H
+        color = _tile_color(r["chg"], scale)
+        tip = (
+            f"{r['symbol']} · {r['name']}\n{r['chg']:+.2f}%\nSector: {r['sector']}\n"
+            f"Price: {r['price']:,.2f}\nValue: {r['value']:,.0f} {CCY}" if r["price"] else f"{r['symbol']}\n{r['chg']:+.2f}%"
+        )
+        label = ""
+        if wpx >= 46 and hpx >= 30:
+            size = max(11, min(26, int((wpx * hpx) ** 0.5 / 7)))
+            label = (
+                f"<div style='font-size:{size}px;font-weight:600'>{_esc(r['symbol'])}</div>"
+                f"<div style='font-size:{max(10, size - 4)}px;opacity:.9'>{r['chg']:+.2f}%</div>"
+            )
+        out.append(
+            f"<div title='{_esc(tip, quote=True).replace(chr(10), '&#10;')}' style='position:absolute;left:{rc['x'] / _HM_W * 100:.3f}%;"
+            f"top:{rc['y'] / _HM_H * 100:.3f}%;width:{rc['w'] / _HM_W * 100:.3f}%;height:{rc['h'] / _HM_H * 100:.3f}%;"
+            f"box-sizing:border-box;padding:1px'><div style='background:{color};height:100%;border-radius:3px;"
+            "display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;overflow:hidden;"
+            f"text-align:center'>{label}</div></div>"
+        )
+    out.append("</div>")
+    return "".join(out)
+
+
+def breadth_html(hist: dict) -> str:
+    n = hist["n"] or 1
+    mx = max(hist["counts"]) or 1
+    bars = []
+    for i, (label, count) in enumerate(zip(hist["labels"], hist["counts"])):
+        color = ins.BREADTH_COLORS[i]
+        txt = ins.BREADTH_NEUTRAL if i == 7 else (ins.BREADTH_LOSER if i < 7 else ins.BREADTH_GAINER)
+        bars.append(
+            "<div style='flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end'>"
+            f"<div style='color:{txt};font-size:12px;margin-bottom:3px'>{count if count else ''}</div>"
+            f"<div style='width:70%;height:{count / mx * 140:.0f}px;background:{color};border-radius:3px'></div>"
+            f"<div style='color:#8a8f98;font-size:10px;margin-top:6px;white-space:nowrap'>{_esc(label)}</div></div>"
+        )
+    seg = lambda c, k: f"<div style='width:{k / n * 100:.1f}%;background:{c};height:6px'></div>"
+    return (
+        f"<div style='display:flex;align-items:flex-end;height:190px'>{''.join(bars)}</div>"
+        f"<div style='display:flex;margin-top:12px;border-radius:3px;overflow:hidden'>"
+        f"{seg(ins.BREADTH_LOSER, hist['losers'])}{seg(ins.BREADTH_NEUTRAL, hist['neutral'])}"
+        f"{seg(ins.BREADTH_GAINER, hist['gainers'])}</div>"
+        "<div style='display:flex;justify-content:space-between;margin-top:8px;font-size:13px'>"
+        f"<div style='color:{ins.BREADTH_LOSER}'>Losers<br><b>{hist['losers']}</b> ({hist['losers'] / n * 100:.1f}%)</div>"
+        f"<div style='color:{ins.BREADTH_NEUTRAL};text-align:center'>Unchanged<br><b>{hist['neutral']}</b> ({hist['neutral'] / n * 100:.1f}%)</div>"
+        f"<div style='color:{ins.BREADTH_GAINER};text-align:right'>Gainers<br><b>{hist['gainers']}</b> ({hist['gainers'] / n * 100:.1f}%)</div>"
+        "</div>"
+    )
+
+
+def _heat_cell_style(v) -> str:
+    if v is None or v != v:
+        return "color:#6b6f76"
+    return f"background-color:{ins.band_color(v)};color:#fff"
+
+
+@st.fragment
+def heatmap_tab(positions) -> None:
+    held = [p for p in positions if p.quantity > 0]
+    if not any(p.symbol not in fund_symbols for p in held):
+        st.info("No open stock positions to map yet.")
+        return
+    map_tab, time_tab = st.tabs(["Market map", "Over time"])
+
+    with map_tab:
+        c1, c2, c3 = st.columns([3, 1.4, 1.2], vertical_alignment="bottom")
+        period = c1.radio("Period", list(ins.HEAT_PERIODS), horizontal=True, key="hm_period")
+        size_by = c2.selectbox("Tile size", ["Market value", "Equal"], key="hm_size")
+        scale = c3.selectbox(
+            "Color scale", [HM_BANDS, "Smooth ±5%", "Smooth ±10%", "Smooth ±20%"], key="hm_scale",
+            help="Bands match the Thndr map: grey under 1%, then three steps at 1%, 2% and 3%+. "
+                 "Smooth blends the colour continuously up to the chosen cap.",
+        )
+        rows = _heat_rows(held, period)
+        have = [r for r in rows if r["chg"] is not None]
+        missing = [r["symbol"] for r in rows if r["chg"] is None]
+        if not have:
+            st.info(
+                f"No price history reaches back far enough for **{period}** yet. Try a shorter period, or use "
+                "**Backfill price history** on the Performance tab."
+            )
+        else:
+            tot = sum(r["value"] for r in have) or 1.0
+            wavg = sum(r["chg"] * r["value"] for r in have) / tot
+            ix = ins.period_return(price_history.get(EGX30_SYMBOL, []), saved_prices.get(EGX30_SYMBOL), cairo_today(), period)
+            best, worst = max(have, key=lambda r: r["chg"]), min(have, key=lambda r: r["chg"])
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(f"Your stocks ({period})", f"{wavg:+.2f}%", help="Value-weighted average of the tiles below.")
+            m2.metric("EGX30", f"{ix:+.2f}%" if ix is not None else "—", delta_color="off")
+            m3.metric("Best", f"{best['symbol']} {best['chg']:+.2f}%", delta_color="off")
+            m4.metric("Worst", f"{worst['symbol']} {worst['chg']:+.2f}%", delta_color="off")
+            st.markdown(treemap_html(have, size_by, scale), unsafe_allow_html=True)
+            if missing:
+                st.caption(f"Not shown (history doesn't cover {period}): {', '.join(missing)}.")
+            st.subheader("Breadth")
+            st.markdown(breadth_html(ins.breadth_histogram([r["chg"] for r in have])), unsafe_allow_html=True)
+            st.caption(
+                "Tile size = market value, shade = size of the move (red falling, green rising; grey under 1%). Hover a tile "
+                "for details. This covers your own holdings, as that's where saved price history exists. Funds "
+                "are left out because they have no daily prices."
+            )
+
+    with time_tab:
+        today_ = cairo_today()
+        syms = [p.symbol for p in held if p.symbol not in fund_symbols]
+        periods = list(ins.HEAT_PERIODS)
+        grid = [
+            {"Symbol": s_, **{
+                per: ins.period_return(price_history.get(s_, []), saved_prices.get(s_), today_, per) for per in periods
+            }}
+            for s_ in syms
+        ]
+        st.subheader("Returns by period")
+        df = pd.DataFrame(grid).set_index("Symbol")
+        st.dataframe(
+            df.style.map(_heat_cell_style).format(lambda v: "—" if v is None or v != v else f"{v:+.1f}%"),
+            use_container_width=True,
+        )
+        st.subheader("Monthly returns")
+        monthly = {s_: ins.monthly_returns(price_history.get(s_, []), saved_prices.get(s_), today_) for s_ in syms}
+        months = sorted({m for d in monthly.values() for m in d})
+        if months:
+            mdf = pd.DataFrame({s_: {m: monthly[s_].get(m) for m in months} for s_ in syms}).T
+            mdf.index.name = "Symbol"
+            st.dataframe(
+                mdf.style.map(_heat_cell_style).format(lambda v: "—" if v is None or v != v else f"{v:+.1f}%"),
+                use_container_width=True,
+            )
+        else:
+            st.info("Not enough saved price history for monthly returns yet.")
+        st.caption(
+            "Periods start from your saved daily closes. A period is shown as — when history doesn't reach back "
+            "that far (it begins when you first backfilled). Monthly returns compare month-end closes, and the "
+            "current month ends at your latest saved price."
+        )
+
+
+with tab_heatmap:
+    heatmap_tab(positions)
 
 
 # --- Net Worth tab --------------------------------------------------------------

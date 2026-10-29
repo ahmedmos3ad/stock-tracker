@@ -400,3 +400,173 @@ def allocate_cash(rooms: Mapping[str, float], cash: float) -> dict[str, float]:
             spent += part
         left -= spent
     return {k: v for k, v in out.items() if v > 0}
+
+
+# --- heatmap ---------------------------------------------------------------------------
+HEAT_PERIODS = {"1D": None, "1W": 7, "1M": 31, "3M": 92, "6M": 183, "1Y": 365, "YTD": "ytd"}
+_BREADTH_EDGES = [0.5, 2.0, 5.0, 8.0, 12.0, 15.0]
+BREADTH_LABELS = ["<-15", "-15…-12", "-12…-8", "-8…-5", "-5…-2", "-2…-0.5", "-0.5…0", "0",
+                  "0…0.5", "0.5…2", "2…5", "5…8", "8…12", "12…15", ">15"]
+
+
+def period_return(
+    points: list[tuple[str, float]], current: Optional[float], today: date, period: str,
+    tolerance_days: int = 5,
+) -> Optional[float]:
+    """% change over a heatmap period, or None when saved history doesn't reach back far enough.
+
+    1D compares the live price with the previous saved close. Other periods use the last close on or
+    before the start date; the start must be covered by history (within ``tolerance_days``) so a
+    short history never masquerades as a long period.
+    """
+    pts = sorted(p for p in points if p[1] and p[1] > 0)
+    if not pts:
+        return None
+    cur = current if current and current > 0 else pts[-1][1]
+    if period == "1D":
+        if abs(cur - pts[-1][1]) > 1e-9:
+            base = pts[-1][1]
+        elif len(pts) >= 2:
+            base = pts[-2][1]
+        else:
+            return None
+        return (cur / base - 1) * 100
+    spec = HEAT_PERIODS.get(period)
+    if spec == "ytd":
+        start = date(today.year, 1, 1)
+    elif isinstance(spec, int):
+        start = today - timedelta(days=spec)
+    else:
+        return None
+    first = date.fromisoformat(pts[0][0])
+    if first > start + timedelta(days=tolerance_days):
+        return None
+    base = _close_on_or_before(pts, start.isoformat())
+    return (cur / base - 1) * 100 if base else None
+
+
+def monthly_returns(
+    points: list[tuple[str, float]], current: Optional[float], today: date
+) -> dict[str, float]:
+    """{'YYYY-MM': % change} using month-end closes (the running month ends at ``current``).
+
+    The first month in the history has no earlier close to compare with, so it's skipped.
+    """
+    pts = sorted(p for p in points if p[1] and p[1] > 0)
+    if len(pts) < 2:
+        return {}
+    ends: dict[str, float] = {}
+    for d, c in pts:
+        ends[d[:7]] = c
+    if current and current > 0:
+        ends[today.isoformat()[:7]] = current
+    months = sorted(ends)
+    return {m: (ends[m] / ends[prev] - 1) * 100 for prev, m in zip(months, months[1:])}
+
+
+def breadth_histogram(changes: Iterable[float]) -> dict:
+    """Count % changes into the market-breadth buckets, plus losers / unchanged / gainers."""
+    from bisect import bisect_left
+
+    counts = [0] * len(BREADTH_LABELS)
+    losers = neutral = gainers = 0
+    for x in changes:
+        if abs(x) < 0.005:
+            counts[7] += 1
+            neutral += 1
+            continue
+        tier = bisect_left(_BREADTH_EDGES, abs(x))  # 0..6
+        if x < 0:
+            counts[6 - tier] += 1
+            losers += 1
+        else:
+            counts[8 + tier] += 1
+            gainers += 1
+    n = losers + neutral + gainers
+    return {"labels": BREADTH_LABELS, "counts": counts, "losers": losers, "neutral": neutral,
+            "gainers": gainers, "n": n}
+
+
+def treemap_layout(items: Iterable[tuple[str, float]], width: float = 1.0, height: float = 1.0) -> list[dict]:
+    """Squarified treemap: rectangles whose areas are proportional to the weights."""
+    items = sorted(((k, float(v)) for k, v in items if v and v > 0), key=lambda kv: -kv[1])
+    total = sum(v for _, v in items)
+    if not items or total <= 0:
+        return []
+    scale = width * height / total
+    rest = [(k, v * scale) for k, v in items]
+    x, y, w, h = 0.0, 0.0, float(width), float(height)
+    out: list[dict] = []
+
+    def worst(row: list[float], side: float) -> float:
+        s = sum(row)
+        return max(side * side * max(row) / (s * s), s * s / (side * side * min(row)))
+
+    while rest:
+        side = min(w, h)
+        row = [rest[0]]
+        i = 1
+        while i < len(rest) and worst([a for _, a in row] + [rest[i][1]], side) <= worst([a for _, a in row], side):
+            row.append(rest[i])
+            i += 1
+        rest = rest[len(row):]
+        s = sum(a for _, a in row)
+        if w >= h:                      # a column on the left
+            cw = s / h
+            cy = y
+            for k, a in row:
+                ch = a / cw
+                out.append({"key": k, "x": x, "y": cy, "w": cw, "h": ch})
+                cy += ch
+            x += cw
+            w -= cw
+        else:                           # a row along the top
+            rh = s / w
+            cx = x
+            for k, a in row:
+                cw = a / rh
+                out.append({"key": k, "x": cx, "y": y, "w": cw, "h": rh})
+                cx += cw
+            y += rh
+            h -= rh
+    return out
+
+
+def heat_color(pct: Optional[float], cap: float = 10.0) -> str:
+    """Dark neutral -> red (losses) / green (gains); the stronger the move, the brighter."""
+    if pct is None:
+        return "#2a2e37"
+    t = min(abs(pct) / cap, 1.0) if cap > 0 else 0.0
+    base = (42, 46, 55)
+    tgt = (190, 40, 62) if pct < 0 else (46, 150, 78)
+    rgb = [round(b + (c - b) * t) for b, c in zip(base, tgt)]
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+# --- Thndr-style heatmap palette (sampled from the reference screenshots) -----------------
+# Market map: 4 discrete bands on |change|. Neutral < 1%, then 1-2%, 2-3%, 3%+.
+HEAT_BANDS = (1.0, 2.0, 3.0)
+HEAT_NEUTRAL = "#282828"
+HEAT_RED_BANDS = ("#311017", "#571523", "#7d1a2f")
+# Green 1-2% and 2-3% come from the first screenshot, 3%+ (#486c2f) from the second (+3.23, +4.54, +5.24,
+# +8.83 all share it). The two screenshots differ by a few RGB units overall, which isn't visible.
+HEAT_GREEN_BANDS = ("#1b2a16", "#2c4a22", "#486c2f")
+
+
+def band_color(pct: Optional[float]) -> str:
+    """Discrete heatmap colour: grey inside +-1%, then three steps of red or green."""
+    if pct is None or abs(pct) < HEAT_BANDS[0]:
+        return HEAT_NEUTRAL
+    level = sum(1 for b in HEAT_BANDS[1:] if abs(pct) >= b)  # 0, 1 or 2
+    return (HEAT_RED_BANDS if pct < 0 else HEAT_GREEN_BANDS)[level]
+
+
+# Breadth histogram bars, one per label in BREADTH_LABELS. Red darkens as losses deepen (the
+# first two are the same, as in the reference); green darkens as gains grow. Sampled values:
+# -12..-8, -8..-5, -5..-2, -2..-0.5 and the three lowest green steps; the rest follow the same steps.
+BREADTH_COLORS = [
+    "#3c151a", "#3c151a", "#541a22", "#6c1f29", "#842431", "#9d2939", "#b62e41",
+    "#757575",
+    "#53a13b", "#4a8e35", "#417b2f", "#386829", "#2f5523", "#26441d", "#1d3317",
+]
+BREADTH_LOSER, BREADTH_NEUTRAL, BREADTH_GAINER = "#fe3d57", "#757575", "#65c647"

@@ -890,6 +890,99 @@ class InsightsTests(unittest.TestCase):
         self.assertAlmostEqual(capped["B"], 300.0)
         self.assertAlmostEqual(sum(ins.allocate_cash({"A": 50.0}, 500.0).values()), 50.0)
 
+    def test_period_return(self):
+        from datetime import date as D
+        from tracker import insights as ins
+
+        pts = [("2026-06-10", 100.0), ("2026-10-20", 110.0), ("2026-10-27", 120.0)]
+        today = D(2026, 10, 29)
+        self.assertAlmostEqual(ins.period_return(pts, 132.0, today, "1D"), 10.0)   # live vs last close
+        self.assertAlmostEqual(ins.period_return(pts, 120.0, today, "1D"), (120 / 110 - 1) * 100)  # equal -> prev close
+        self.assertAlmostEqual(ins.period_return(pts, 120.0, today, "1W"), (120 / 110 - 1) * 100)  # base 10-22 -> 10-20
+        self.assertIsNone(ins.period_return(pts, 120.0, today, "6M"))   # history starts Jun 10, 6M reaches earlier
+        self.assertIsNone(ins.period_return(pts, 120.0, today, "YTD"))  # history starts after Jan 1
+        self.assertIsNone(ins.period_return([], 1.0, today, "1M"))
+        self.assertIsNone(ins.period_return(pts[:1], 100.0, today, "1D"))
+
+    def test_monthly_returns(self):
+        from datetime import date as D
+        from tracker import insights as ins
+
+        pts = [("2026-06-10", 100.0), ("2026-06-30", 110.0), ("2026-07-15", 100.0), ("2026-07-31", 121.0)]
+        m = ins.monthly_returns(pts, 133.1, D(2026, 8, 5))
+        self.assertEqual(sorted(m), ["2026-07", "2026-08"])             # first month has no base
+        self.assertAlmostEqual(m["2026-07"], 10.0)
+        self.assertAlmostEqual(m["2026-08"], 10.0)                      # current price ends the running month
+        self.assertEqual(ins.monthly_returns(pts[:1], 1.0, D(2026, 8, 5)), {})
+
+    def test_breadth_histogram(self):
+        from tracker import insights as ins
+
+        h = ins.breadth_histogram([-20, -13, -9, -6, -3, -1, -0.2, 0.0, 0.3, 1, 3, 6, 10, 14, 30])
+        self.assertEqual(h["counts"], [1] * 15)
+        self.assertEqual((h["losers"], h["neutral"], h["gainers"], h["n"]), (7, 1, 7, 15))
+        edge = ins.breadth_histogram([-15.0, -0.5, 0.5, 15.0])           # edges fall in the milder bucket
+        self.assertEqual(edge["counts"][1], 1)     # -15 -> "-15…-12"
+        self.assertEqual(edge["counts"][6], 1)     # -0.5 -> "-0.5…0"
+        self.assertEqual(edge["counts"][8], 1)     # 0.5 -> "0…0.5"
+        self.assertEqual(edge["counts"][13], 1)    # 15 -> "12…15"
+
+    def test_treemap_layout(self):
+        from tracker import insights as ins
+
+        items = [("A", 50.0), ("B", 25.0), ("C", 15.0), ("D", 10.0), ("Z", 0.0)]
+        rects = ins.treemap_layout(items, 2.5, 1.0)
+        self.assertEqual({r["key"] for r in rects}, {"A", "B", "C", "D"})   # zero weight dropped
+        self.assertAlmostEqual(sum(r["w"] * r["h"] for r in rects), 2.5)
+        by = {r["key"]: r["w"] * r["h"] for r in rects}
+        self.assertAlmostEqual(by["A"] / by["B"], 2.0)
+        for r in rects:                                                      # all inside the canvas
+            self.assertGreaterEqual(r["x"], -1e-9)
+            self.assertGreaterEqual(r["y"], -1e-9)
+            self.assertLessEqual(r["x"] + r["w"], 2.5 + 1e-9)
+            self.assertLessEqual(r["y"] + r["h"], 1.0 + 1e-9)
+        for i, a in enumerate(rects):                                        # and don't overlap
+            for b in rects[i + 1:]:
+                ox = min(a["x"] + a["w"], b["x"] + b["w"]) - max(a["x"], b["x"])
+                oy = min(a["y"] + a["h"], b["y"] + b["h"]) - max(a["y"], b["y"])
+                self.assertFalse(ox > 1e-9 and oy > 1e-9)
+        self.assertEqual(ins.treemap_layout([]), [])
+        self.assertEqual(len(ins.treemap_layout([("A", 1.0)])), 1)
+
+    def test_heat_color(self):
+        from tracker import insights as ins
+
+        self.assertEqual(ins.heat_color(0.0), "#2a2e37")
+        self.assertEqual(ins.heat_color(None), "#2a2e37")
+        self.assertEqual(ins.heat_color(-50.0, 10.0), ins.heat_color(-10.0, 10.0))  # clipped at the cap
+        self.assertNotEqual(ins.heat_color(-5.0), ins.heat_color(5.0))             # red vs green
+        self.assertTrue(ins.heat_color(-1.0).startswith("#"))
+
+    def test_band_color_matches_reference(self):
+        from tracker import insights as ins
+
+        # Colours sampled from the reference heatmap: COMI -1.72, EMFD -2.26, TMGH -3.74, MFPC +2.52,
+        # CCAP -0.95 and BQDC 0.00 (grey).
+        self.assertEqual(ins.band_color(-1.72), "#311017")
+        self.assertEqual(ins.band_color(-2.26), "#571523")
+        self.assertEqual(ins.band_color(-3.74), "#7d1a2f")
+        self.assertEqual(ins.band_color(-16.08), "#7d1a2f")           # 3%+ all share the brightest band
+        self.assertEqual(ins.band_color(2.52), "#2c4a22")
+        self.assertEqual(ins.band_color(-0.95), "#282828")
+        self.assertEqual(ins.band_color(0.0), "#282828")
+        self.assertEqual(ins.band_color(None), "#282828")
+        # Second screenshot (another day): +3.23/+4.54/+5.24/+8.83 share the brightest green,
+        # +1.77/+1.79 are the darkest green, and -2.97/-2.99 still sit in the 2-3% band.
+        self.assertEqual(ins.band_color(3.23), "#486c2f")
+        self.assertEqual(ins.band_color(8.83), "#486c2f")
+        self.assertEqual(ins.band_color(1.77), "#1b2a16")
+        self.assertEqual(ins.band_color(-2.99), "#571523")
+        self.assertEqual(ins.band_color(-3.39), "#7d1a2f")
+        self.assertEqual(ins.band_color(0.5), "#282828")
+        self.assertEqual(ins.band_color(1.0), "#1b2a16")              # boundaries step up
+        self.assertEqual(ins.band_color(-2.0), "#571523")
+        self.assertEqual(len(ins.BREADTH_COLORS), len(ins.BREADTH_LABELS))
+
     def test_alpha_series(self):
         from tracker import insights as ins
 

@@ -9,6 +9,8 @@ venv/
 portfolio.db
 *.sqlite
 *.sqlite3
+backups/
+images/
 
 # OS / editor
 .DS_Store
